@@ -2,7 +2,7 @@
 	"name": "kiro-gateway",
 	"displayName": "Kiro Gateway",
 	"description": "Route Kiro's built-in chat through your own API key, JSON login, or an Anthropic-compatible relay.",
-	"version": "2.0.0",
+	"version": "2.0.1",
 	"publisher": "local",
 	"license": "MIT",
 	"repository": {
@@ -38,7 +38,7 @@
 	"main": "./extension.js",
 	"scripts": {
 		"build:webview": "npm --prefix webview-ui install --no-audit --no-fund && npm --prefix webview-ui run build:prod",
-		"package": "npm run build:webview && npx --yes @vscode/vsce@latest package --allow-star-activation --skip-license --allow-missing-repository"
+		"package": "npx --yes @vscode/vsce@latest package --allow-star-activation"
 	},
 	"contributes": {
 		"commands": [
@@ -60,12 +60,7 @@
 			},
 			{
 				"command": "kiroGateway.reloadWindow",
-				"title": "Reload Window (apply update)",
-				"category": "Kiro Gateway"
-			},
-			{
-				"command": "kiroGateway.checkUpdate",
-				"title": "Check For Pending Update",
+				"title": "Reload Window",
 				"category": "Kiro Gateway"
 			},
 			{

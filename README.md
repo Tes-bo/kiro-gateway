@@ -15,15 +15,24 @@ The extension id is `local.kiro-gateway`. Commands and settings use the `kiroGat
 
 ## Install
 
-This is not published to a marketplace yet. Package a VSIX and install it in Kiro:
+Kiro checks [Open VSX](https://open-vsx.org) for extension updates. Once Kiro Gateway is listed there, install it from Kiro's Extensions view. A new version shows up in the Extensions view, under Updates. With **Extensions: Auto Update** turned on, Kiro downloads it for you. After it is installed, the extension entry shows **Restart Extensions**. That restarts the extension host when you choose. The extension does not scan its own install folder and does not ask you to reload for an update.
 
-```bash
-npx --yes @vscode/vsce@latest package --allow-star-activation --skip-license --allow-missing-repository
-```
-
-Then install the generated `.vsix` from Kiro with **Extensions: Install from VSIX**.
+A copy installed from a VSIX file stays outside that update list. Use the Extensions view if you want later versions to show up there.
 
 Kiro reads the gateway endpoints once, when the window starts. After you turn the gateway on, or after you change mode, reload the window.
+
+## Publishing
+
+Publish each release to Open VSX. Kiro can then update it from the Extensions view. The extension id stays `local.kiro-gateway`, so the Open VSX namespace is `local`. That namespace already exists and has no extensions yet. The publishing account has to be a member of it.
+
+Create an access token at [open-vsx.org](https://open-vsx.org) after signing the publisher agreement, then either:
+
+```bash
+npm run package
+npx --yes ovsx publish *.vsix -p "$OVSX_PAT"
+```
+
+or add the token as the `OVSX_PAT` repository secret. The publish workflow runs when a GitHub release is published.
 
 ## API key direct
 

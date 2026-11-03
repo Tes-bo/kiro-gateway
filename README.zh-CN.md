@@ -15,15 +15,24 @@
 
 ## 安装
 
-还没有发布到扩展市场。在本仓库打包 VSIX，再装进 Kiro：
+Kiro 向 [Open VSX](https://open-vsx.org) 查询扩展更新。Kiro Gateway 出现在那里之后，从 Kiro 的扩展中心安装。有新版本时，扩展中心的 Updates 里会出现条目。打开 **Extensions: Auto Update** 后，Kiro 会自己下载。装完后，扩展条目上是 **Restart Extensions**，由你决定什么时候重启扩展宿主。插件不再扫描自己的安装目录，也不会为了更新另弹重载窗口。
 
-```bash
-npx --yes @vscode/vsce@latest package --allow-star-activation --skip-license --allow-missing-repository
-```
-
-在 Kiro 里用 **Extensions: Install from VSIX** 安装生成的 `.vsix`。
+从 VSIX 文件装进去的那一份不进这个更新列表。想让以后的版本出现在扩展中心，就从扩展中心安装。
 
 Kiro 只在窗口启动时读取网关端点。打开网关或切换模式之后，需要重新加载窗口。
+
+## 发布
+
+每个版本发到 Open VSX 之后，Kiro 才能按扩展中心的方式更新。扩展 id 保持 `local.kiro-gateway`，所以 Open VSX 上的命名空间是 `local`。这个命名空间已经存在，里面还没有扩展。发布用的账号必须是该命名空间的成员。
+
+在 [open-vsx.org](https://open-vsx.org) 签好发布协议并创建访问令牌，然后可以：
+
+```bash
+npm run package
+npx --yes ovsx publish *.vsix -p "$OVSX_PAT"
+```
+
+也可以把令牌存成仓库密钥 `OVSX_PAT`。GitHub Release 发布时会走自动发布流程。
 
 ## API Key 直连
 

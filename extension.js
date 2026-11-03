@@ -4423,136 +4423,9 @@ function registryHealth() {
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// 装了新包但还没重载的检测
-// ---------------------------------------------------------------------------
-// 侧载 VSIX 时 Kiro 不一定会弹「需要重新加载」，于是新代码明明已经躺在磁盘上，
-// 跑着的却还是旧实例，只能靠重启整个 Kiro。这里由旧实例自己发现这件事并提示：
-//   1) 扩展目录里出现了同 id 的更高版本 → 正常升级
-//   2) 自己目录里的文件被覆盖（版本号没变的重复打包）→ 指纹变了
-// 两种都只需要重新加载窗口，不必重启 Kiro。
-const UPDATE_POLL_MS = 10000;
-let _selfStamp = "";          // 启动时自身文件的指纹
-let _pendingUpdate = null;    // { version, reason }
-let _updateTimer = null;
-let _updateNotified = false;  // 弹窗只弹一次，横幅和状态栏则一直留着
-
-function fileStamp(file) {
-  try {
-    const st = fsMod.statSync(file);
-    return st.size + ":" + Math.round(st.mtimeMs);
-  } catch { return "-"; }
-}
-// 自身关键文件的指纹。覆盖安装同一个版本号时，目录名不变但文件会被换掉。
-function computeSelfStamp() {
-  const dir = extContext?.extensionPath || "";
-  if (!dir) return "";
-  return ["extension.js", "package.json", path.join("webview-ui", "dist", "index.html")]
-    .map((f) => fileStamp(path.join(dir, f)))
-    .join("|");
-}
-function cmpVersion(a, b) {
-  const pa = String(a).split(/[.\-+]/);
-  const pb = String(b).split(/[.\-+]/);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const na = parseInt(pa[i], 10) || 0;
-    const nb = parseInt(pb[i], 10) || 0;
-    if (na !== nb) return na - nb;
-  }
-  return 0;
-}
-// 磁盘上这个扩展的最高版本：先看注册表，再扫 <id>-<version> 目录名兜底。
-function newestInstalledVersion() {
-  const root = extensionsRootDir();
-  const id = myExtId().toLowerCase();
-  let best = currentVersion();
-  const consider = (v) => {
-    const clean = cleanVersion(v);
-    if (clean && cmpVersion(clean, best) > 0) best = clean;
-  };
-  const list = readJsonSafe(path.join(root, "extensions.json"), null);
-  if (Array.isArray(list)) {
-    for (const e of list) {
-      if (String(e?.identifier?.id || "").toLowerCase() === id) consider(e?.version);
-    }
-  }
-  try {
-    for (const name of fsMod.readdirSync(root)) {
-      const lower = name.toLowerCase();
-      if (!lower.startsWith(id + "-")) continue;
-      consider(name.slice(id.length + 1));
-    }
-  } catch {}
-  return best;
-}
-// 检查一次，返回待生效的更新（没有则 null）。
-function detectPendingUpdate() {
-  if (!extContext) return null;
-  const newest = newestInstalledVersion();
-  if (cmpVersion(newest, currentVersion()) > 0) {
-    return { version: newest, reason: "newer-version" };
-  }
-  const stamp = computeSelfStamp();
-  if (_selfStamp && stamp && stamp !== _selfStamp) {
-    return { version: currentVersion(), reason: "reinstalled" };
-  }
-  return null;
-}
-function pendingUpdateInfo() {
-  if (!_pendingUpdate) return null;
-  return {
-    version: _pendingUpdate.version,
-    running: currentVersion(),
-    reason: _pendingUpdate.reason,
-  };
-}
-async function announcePendingUpdate(found) {
-  _pendingUpdate = found;
-  const isNewer = found.reason === "newer-version";
-  const text = isNewer
-    ? "Kiro Gateway 已安装新版本 v" + found.version + "（当前运行 v" + currentVersion() + "）"
-    : "Kiro Gateway 的插件文件已更新（v" + found.version + "）";
-  log("检测到待生效的插件更新: " + found.reason + " -> v" + found.version
-    + "（运行中 v" + currentVersion() + "），重新加载窗口即可生效");
-  updateStatusBar();
-  if (panelProvider) panelProvider.pushState();
-  if (_updateNotified) return;
-  _updateNotified = true;
-  // 打开了自动重载就直接重载，留一点时间把日志和面板状态刷出去。
-  if (pref("autoReloadOnUpdate", false) === true) {
-    log("自动重载已开启，1.5 秒后重新加载窗口");
-    vscode.window.setStatusBarMessage("Kiro Gateway：检测到更新，正在重新加载窗口…", 3000);
-    setTimeout(() => { vscode.commands.executeCommand("workbench.action.reloadWindow"); }, 1500);
-    return;
-  }
-  const pick = await vscode.window.showInformationMessage(
-    text + "，重新加载窗口即可生效（不用重启 Kiro）。",
-    "重新加载窗口",
-    "稍后"
-  );
-  if (pick === "重新加载窗口") await vscode.commands.executeCommand("workbench.action.reloadWindow");
-}
-function checkForPendingUpdate() {
-  if (_pendingUpdate) return; // 已经在提示了
-  let found = null;
-  try { found = detectPendingUpdate(); } catch (e) { log("!! 更新检测失败: " + (e?.message || e)); }
-  if (found) announcePendingUpdate(found);
-}
-// 事件 + 轮询双保险：onDidChange 在部分 Kiro 构建里不触发，而扫目录很轻。
-function startUpdateWatch() {
-  _selfStamp = computeSelfStamp();
-  checkForPendingUpdate();
-  if (_updateTimer) clearInterval(_updateTimer);
-  _updateTimer = setInterval(checkForPendingUpdate, UPDATE_POLL_MS);
-  try {
-    return vscode.extensions.onDidChange(() => checkForPendingUpdate());
-  } catch {
-    return { dispose() {} };
-  }
-}
-function stopUpdateWatch() {
-  if (_updateTimer) { clearInterval(_updateTimer); _updateTimer = null; }
-}
+// Updates come from Kiro's extension gallery (Open VSX). Kiro lists them in
+// the Extensions view and applies them with Restart Extensions. This extension
+// does not scan the local install.
 
 // ---------------------------------------------------------------------------
 // Direct API calls (used by the Test button and the panel's model/usage view)
@@ -6342,16 +6215,6 @@ function updateStatusBar() {
     statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     statusBarItem.command = "kiroGateway.openPanel";
   }
-  // 有待生效的更新时，状态栏优先说这件事，并且点一下就直接重载。
-  if (_pendingUpdate) {
-    statusBarItem.text = "$(sync) Kiro Gateway: 待重载生效";
-    statusBarItem.tooltip = "已安装 v" + _pendingUpdate.version + "（运行中 v" + currentVersion()
-      + "）· 点击重新加载窗口生效";
-    statusBarItem.command = "kiroGateway.reloadWindow";
-    statusBarItem.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
-    statusBarItem.show();
-    return;
-  }
   const relayMode = isRelayMode();
   const on = isEnabled() && credentialsReady();
   const icon = relayMode ? "$(arrow-swap)" : "$(key)";
@@ -6506,8 +6369,6 @@ class ControlPanelProvider {
       obsolete: rh.obsolete,
       hideApiKey: getHideApiKey(),
       autoRefresh: getAutoRefresh(),
-      pendingUpdate: pendingUpdateInfo(),
-      autoReloadOnUpdate: pref("autoReloadOnUpdate", false) === true,
       prompts: getPromptPrefs(),
       autoSwitch: getSwitchPrefs(),
       retry: getRetryPrefs(),
@@ -7044,10 +6905,6 @@ class ControlPanelProvider {
         this.pushState();
         break;
       }
-      case "setAutoReload":
-        await setPref("autoReloadOnUpdate", !!msg.value);
-        this.pushState();
-        break;
       case "setRenew": {
         // 面板「保存配置」一次性提交整份配置，宿主再夹一遍取值区间。
         await setRenewPrefs(msg.patch || {});
@@ -7493,10 +7350,6 @@ async function activate(context) {
     vscode.commands.registerCommand("kiroGateway.reloadWindow", async () => {
       await vscode.commands.executeCommand("workbench.action.reloadWindow");
     }),
-    vscode.commands.registerCommand("kiroGateway.checkUpdate", async () => {
-      checkForPendingUpdate();
-      if (!_pendingUpdate) vscode.window.showInformationMessage("Kiro Gateway 已是磁盘上的最新版本 v" + currentVersion());
-    }),
     vscode.commands.registerCommand("kiroGateway.toggle", async () => {
       await set("enabled", !isEnabled());
       await applyState();
@@ -7600,9 +7453,6 @@ async function activate(context) {
     })
   );
 
-  // 侧载安装后 Kiro 常常不提示重载，靠这个监视器自己发现并提醒。
-  context.subscriptions.push(startUpdateWatch());
-
   await applyState({ silent: true });
   updateStatusBar();
   // 权限自动放行：按当前开关同步一次 ~/.kiro/settings/permissions.yaml。
@@ -7627,7 +7477,6 @@ function deactivate() {
   // reloaded host re-applies it. Turn the gateway switch off to undo.
   if (krsServer) krsServer.stop();
   if (cpsServer) cpsServer.stop();
-  stopUpdateWatch();
   stopDailyReset();
   stopRenewLoop();
   stopHealthSweep();
