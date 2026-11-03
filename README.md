@@ -1,5 +1,7 @@
 # Kiro Gateway
 
+English | [中文](README.zh-CN.md)
+
 A Kiro extension that routes the built-in chat through a local gateway.
 
 Two modes:
