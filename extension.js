@@ -4341,7 +4341,7 @@ async function syncEndpoints() {
 // THIS extension's own entries.
 // ---------------------------------------------------------------------------
 function myExtId() {
-  return extContext?.extension?.id || "kiro-gateway.kiro-gateway";
+  return extContext?.extension?.id || "tesbo.kiro-gateway";
 }
 function myExtDirName() {
   try { return path.basename(extContext.extensionPath); } catch { return ""; }

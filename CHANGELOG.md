@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.3 — 2026-11-03
+
+The Open VSX namespace is `tesbo`. The extension id is `tesbo.kiro-gateway`. Commands, settings, and saved state still use the `kiroGateway` prefix. The panel footer still shows the release date `2026-11-03`.
+
 ## 2.0.2 — 2026-11-03
 
 The Open VSX namespace is `kiro-gateway`. The extension id is `kiro-gateway.kiro-gateway`. The `local` namespace already belonged to someone else, so 2.0.1 could not be published there.
