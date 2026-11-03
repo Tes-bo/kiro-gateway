@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.4 — 2026-11-03
+
+The panel follows Kiro's language, with a Chinese / English switch at the top and a `kiroGateway.language` setting (`auto`, `zh`, `en`). The two buttons at the top only change the page. The route that is running stays until you confirm; confirming stops that route and reloads the window. Cancel leaves it running. Code comments in `extension.js` and `relay.js` are English.
+
 ## 2.0.3 — 2026-11-03
 
 The Open VSX namespace is `tesbo`. The extension id is `tesbo.kiro-gateway`. Commands, settings, and saved state still use the `kiroGateway` prefix. The panel footer still shows the release date `2026-11-03`.

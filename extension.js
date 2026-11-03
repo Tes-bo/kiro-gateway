@@ -32,37 +32,37 @@ const crypto = require("crypto");
 const { URL } = require("url");
 
 // ---------------------------------------------------------------------------
-// 上游连接池
+// Upstream connection pool
 //
-// 每建一条新连接要付一次完整握手：本机→Clash→节点服务器→目标站，三段的 TCP 与
-// TLS 合计 4–6 个 RTT。实测约 1.4s，而复用一条已有连接只要 0.30s —— 一次请求
-// 差 1.1 秒，这是整条链路上最大的一笔开销。
+// Every new connection pays for a full handshake: this machine → Clash → node server → target site, TCP across the three hops plus
+// TLS, 4–6 RTTs in total. Measured at about 1.4s, while reusing an existing connection takes only 0.30s — one request
+// is a 1.1-second gap, the single biggest cost on the whole path.
 //
-// Node 的 https.globalAgent 虽然 keepAlive 默认开着，但空闲 socket 只留 5 秒
-// （实测：间隔 4s 复用 0.31s，间隔 6s 弹回 1.61s）。一轮对话内 Kiro 连发的几个
-// 请求能吃到复用，但跨轮次（用户读回复、打字）几乎必然超过 5 秒，握手就回来了。
-// 所以自己管一个池子，把空闲保留拉到 30 秒。
+// Node's https.globalAgent has keepAlive on by default, but an idle socket is kept for only 5 seconds
+// (measured: a 4s gap reuses in 0.31s, a 6s gap jumps back to 1.61s). The few requests Kiro fires within one turn
+// can hit reuse, but across turns (the user reading the reply, typing) they almost always exceed 5 seconds, and the handshake is back.
+// So we keep our own pool and stretch idle retention to 30 seconds.
 //
-// 前提：Kiro 必须设置
+// Prerequisite: Kiro must set
 //     "http.proxySupport": "off"
 //     "http.experimental.systemCertificatesV2": true
-// 否则 @vscode/proxy-agent 会把这里传的 agent 整个换掉，而它换上去的那个
-// PacProxyAgent 的 keepAlive 是被显式注释掉的（见 vscode#228872），白搭。
+// Otherwise @vscode/proxy-agent replaces the agent passed in here entirely, and the one it puts in its place,
+// PacProxyAgent, has keepAlive explicitly commented out (see vscode#228872), so this does nothing.
 const UPSTREAM_AGENT = new https.Agent({
   keepAlive: true,
   keepAliveMsecs: 30000,
   maxSockets: 32,
   maxFreeSockets: 8,
-  scheduling: "lifo", // 优先复用最近用过的，命中率高于 fifo
-  timeout: 310000,    // 与单请求超时对齐，别让 agent 先掐断长生成
-  family: 4,          // 坏掉的 IPv6 会在 TLS 握手完成前把连接掐掉
+  scheduling: "lifo", // Prefer the most recently used socket; the hit rate is higher than fifo
+  timeout: 310000,    // Line this up with the per-request timeout so the agent does not cut off a long generation first
+  family: 4,          // A broken IPv6 path drops the connection before the TLS handshake finishes
 });
 
-// 复用的代价：空闲 socket 可能被上游先关掉，重发时报 ECONNRESET。
-// 插件原有的 isTransportFailure 已把 econnreset 列入传输层失败，退避重发这条
-// 通路正好接住，所以这里不需要额外容错。
-// 中转站模式的协议翻译层。它不 require("vscode")，所有配置/日志/统计都由这边在
-// activate 时通过 relay.init() 注入。
+// The cost of reuse: an idle socket may already have been closed upstream, and a resend then reports ECONNRESET.
+// The extension's existing isTransportFailure already lists econnreset as a transport failure, and the backoff-resend
+// path catches exactly that, so no extra fault tolerance is needed here.
+// Protocol-translation layer for relay mode. It does not require("vscode"); all config, logs, and stats are injected from here
+// during activate via relay.init().
 const relay = require("./relay.js");
 
 const CONFIG_NS = "kiroGateway";
@@ -209,22 +209,22 @@ function stripProfileArnFromBody(bodyBuf) {
 
 // Strip profileArn from the QUERY STRING as well.
 //
-// stripProfileArnFromBody 只能覆盖有请求体的操作。控制面上有一批 REST GET 操作
-// （GetUsageLimits / ListAvailableModels 这类）把 profileArn 序列化成查询参数，
-// GET 没有 body，那道清理直接空过，profileArn 就跟着 ksk_ 凭证一起发上去了。
-// 上游看到「API key 凭证 + OAuth 身份的 profileArn」这种不可能的组合，回
-// HTTP 403 {"message":"Invalid token"}。
+// stripProfileArnFromBody only covers operations that have a request body. The control plane has a batch of REST GET operations
+// (GetUsageLimits / ListAvailableModels and the like) that serialize profileArn as a query parameter.
+// A GET has no body, so that cleanup is a no-op and profileArn goes out together with the ksk_ credential.
+// Upstream sees the impossible combination "API key credential + an OAuth identity's profileArn" and returns
+// HTTP 403 {"message":"Invalid token"}.
 //
-// 症状：Kiro 自带的账户面板显示「Unable to fetch account usage data: Invalid
-// token」。实测同一个 URL 去掉这个参数就是 200 + 正常用量数据。
-// 所以查询串按同一条规则处理：只要出现 profileArn 就摘掉，其余参数原样保留、
-// 顺序不动 —— 转发依然是「除凭证与 profileArn 外一个字节不改」。
+// Symptom: Kiro's built-in account panel shows "Unable to fetch account usage data: Invalid
+// token". The same URL with this parameter removed measures as 200 plus normal usage data.
+// So the query string follows the same rule: if profileArn appears, strip it, and keep every other parameter as-is,
+// order unchanged — forwarding is still "not one byte changed except the credentials and profileArn".
 function stripProfileArnFromUrl(rawUrl) {
   const url = String(rawUrl || "");
   const q = url.indexOf("?");
   if (q < 0) return url;
   const pathPart = url.slice(0, q);
-  // 大小写不敏感地找：不同 SDK 版本的参数名大小写不保证一致。
+  // Search case-insensitively: parameter-name casing is not guaranteed across SDK versions.
   const kept = [];
   let removed = false;
   for (const pair of url.slice(q + 1).split("&")) {
@@ -233,7 +233,7 @@ function stripProfileArnFromUrl(rawUrl) {
     if (decodeURIComponent(name).toLowerCase() === "profilearn") { removed = true; continue; }
     kept.push(pair);
   }
-  if (!removed) return url; // 没有就原样返回，绝不重新编码
+  if (!removed) return url; // If it is not there, return the URL unchanged and never re-encode
   return kept.length ? pathPart + "?" + kept.join("&") : pathPart;
 }
 
@@ -263,9 +263,9 @@ function get(key, def) {
 }
 async function set(key, value) {
   await cfg().update(key, value, vscode.ConfigurationTarget.Global);
-  // 远程经常同时开好几个窗口，只有占着端口的那个真正转发。
-  // 配置写到另一边的窗口不一定能读到，所以选中项的编号再落一份本机文件。
-  // 文件里只有编号，不放 refresh token。
+  // Remote sessions often have several windows open at once; only the one holding the port actually forwards.
+  // Config written in another window is not necessarily readable here, so the selected item's index is also written to a local file.
+  // The file holds only the index, not the refresh token.
   if (key === "activeApiKey") {
     try { writeSharedActiveId(value); } catch (e) {
       log("!! 记录选中项失败: " + (e && e.message ? e.message : e));
@@ -312,13 +312,13 @@ async function setApiKeys(list) {
   await set("apiKeys", clean);
   // Deleted keys must not keep their per-key usage counters around.
   pruneKeyStats(clean);
-  // 顺手记下新密钥的添加时间、清掉已删除密钥的那条（面板要显示「添加于」）。
+  // Also record when a new key was added, and drop the entry for a deleted key (the panel shows "added on").
   await syncKeyAddedAt(clean);
   await pruneJsonCreds(clean);
   return clean;
 }
-// 密钥的添加时间。按指纹存在 globalState 里（不落明文），密钥列表本身是配置里的
-// 一个字符串数组，带不了这类元数据。
+// When each key was added. Stored in globalState by fingerprint (no plaintext). The key list itself is
+// a string array in config and cannot carry this kind of metadata.
 function keyAddedAll() {
   const m = pref("keyAddedAt", {});
   return m && typeof m === "object" ? m : {};
@@ -328,8 +328,8 @@ function keyAddedAt(key) {
   if (!fp) return 0;
   return Number(keyAddedAll()[fp]) || 0;
 }
-// 给还没有时间戳的密钥补上"现在"，并丢掉已经不存在的密钥。第一次升级到这个版本
-// 时，老密钥拿不到真正的添加时刻，只能以看到它的那一刻为准。
+// Stamp "now" onto keys that still have no timestamp, and drop keys that no longer exist. The first time you upgrade to this version,
+// old keys have no real add time, so the moment we first see them is as close as we can get.
 async function syncKeyAddedAt(keys) {
   const list = Array.isArray(keys) ? keys : getApiKeys();
   const now = Date.now();
@@ -355,25 +355,25 @@ async function migrateLegacyKey() {
   await set("apiKey", "");
 }
 const DEFAULT_REGION = "us-east-1";
-// 自动识别地区的候选。Kiro 目前只在弗吉尼亚（us-east-1）和法兰克福
+// Region candidates for auto-detection. Kiro currently only runs in Virginia (us-east-1) and Frankfurt
 const REGION_CANDIDATES = ["us-east-1", "eu-central-1"];
-// 自动识别的结果按密钥缓存这么久，过期后下一次会重新探一遍（订阅迁移到别的区域
-// 时不至于一直用旧结果）。
+// Auto-detection results are cached per key for this long. After expiry the next call probes again (if the subscription moves to another region
+// we do not keep using the old result forever).
 const REGION_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 function configuredRegion() {
   const r = String(get("region", DEFAULT_REGION) || DEFAULT_REGION).trim();
   return r || DEFAULT_REGION;
 }
-// JSON 凭证的归属区域。profileArn 里的区域是账号注册地，比「用量接口回了 200」
-// 可靠：Get-Usage-Limits 在另一个区域也可能 200，但 List-Available-Models 会给空列表。
+// Home region of a JSON credential. The region inside profileArn is where the account was registered, which is more reliable than "the usage API returned 200":
+// Get-Usage-Limits can also return 200 in another region, but List-Available-Models then returns an empty list.
 function jsonHomeRegion(key) {
   if (!isJsonKey(key)) return "";
   const cred = getJsonCred(key);
   if (!cred) return "";
   return regionFromProfileArn(cred.profileArn) || String(cred.region || "").trim();
 }
-// 用量探测的缓存。和 profileArn 矛盾时作废，否则会把 BuilderId 这类号钉死在
-// 一个「用量能查、模型列表为空」的区域上。
+// Cache of usage probes. Invalidate it when it contradicts profileArn, or a BuilderId-style account gets pinned to
+// a region where usage can be queried but the model list is empty.
 function trustedCachedRegion(key) {
   const cached = cachedRegionFor(key);
   if (!cached) return "";
@@ -394,21 +394,21 @@ function getRegion() {
   }
   return configuredRegion();
 }
-// 「地区」是否交给自动识别。默认开启：绝大多数用户并不知道自己的密钥属于哪个
-// 区域，让插件拿密钥去两个候选端点各问一次即可，比让人猜更可靠。
+// Whether "region" is left to auto-detection. On by default: most users do not know which
+// region their key belongs to. Having the extension ask both candidate endpoints once each is more reliable than making the user guess.
 function isRegionAuto() {
   return pref("regionAuto", true) === true;
 }
 async function setRegionAutoPref(v) {
   await setPref("regionAuto", !!v);
 }
-// 参与探测的地区：内置候选 + 当前配置值（可能是用户填的自定义地区）。
+// Regions that take part in probing: the built-in candidates plus the current config value (which may be a custom region the user typed).
 function regionCandidates() {
   return [...new Set([...REGION_CANDIDATES, getRegion()]
     .map((r) => String(r || "").trim())
     .filter(Boolean))];
 }
-// 识别结果按密钥指纹（sha256 前 16 位）缓存，不落密钥明文。
+// Detection results are cached by key fingerprint (first 16 hex chars of sha256); the key plaintext is not stored.
 function regionCacheAll() {
   const m = pref("regionByKey", {});
   return m && typeof m === "object" ? m : {};
@@ -426,7 +426,7 @@ async function rememberRegionFor(key, region) {
   if (!fp || !region) return;
   const m = { ...regionCacheAll() };
   m[fp] = { region: String(region), at: Date.now() };
-  // 只保留当前还存在的密钥，删掉的密钥不留痕。
+  // Keep only keys that still exist; a deleted key leaves no trace.
   const alive = new Set(getApiKeys().map(keyFingerprint).filter(Boolean));
   for (const k of Object.keys(m)) if (!alive.has(k)) delete m[k];
   await setPref("regionByKey", m);
@@ -439,10 +439,137 @@ function getPorts() {
   return { krs: Number(p.krs) || 19820, cps: Number(p.cps) || 19821 };
 }
 // ---------------------------------------------------------------------------
-// 工作模式：official（APIKEY 直连）/ relay（中转站）
+// Working mode: official (APIKEY direct) / relay (relay station)
 const MODE_OFFICIAL = "official";
 const MODE_RELAY = "relay";
 const MODE_LABEL = { official: "APIKEY 直连", relay: "中转站" };
+// User-visible host strings. The panel has its own dictionary. Longest match wins.
+const HOST_EN = {
+  "APIKEY 直连": "API key",
+  "中转站": "Relay",
+  "未开启": "Off",
+  "重新加载窗口": "Reload Window",
+  "切换并重新加载": "Switch and reload",
+  "Kiro Gateway 已接管内置对话。需要重新加载窗口后 Kiro 才会走新端点。": "Kiro Gateway is now in front of built-in chat. Reload the window before Kiro uses the new endpoint.",
+  "Kiro Gateway 未启用（点击打开面板）": "Kiro Gateway is off (click to open the panel)",
+  " · 中转站地址或 Key 还没填": " · relay address or key is missing",
+  " · 还没有可用的 API Key": " · no API key yet",
+  "中转站模式 · ": "Relay · ",
+  " 个模型": " models",
+  "APIKEY 直连 · region=": "API key · region=",
+  "（自动识别）": " (auto)",
+  "工作区设置覆盖了 ": "A workspace setting overrides ",
+  "，请删除工作区中的同名配置后重新加载窗口。": ". Remove that workspace value, then reload the window.",
+  "无法写入或验证 ": "Could not write or verify ",
+  "。请打开日志查看实际 settings.json 路径。": ". Open the log to see the settings.json path.",
+  "没能读到任何文件内容": "Could not read any file",
+  "这些 JSON 凭证已经在列表里了": "These JSON credentials are already in the list",
+  "文件里没有可识别的凭证（需要 refreshToken 或 ksk_）": "No usable credential in the file (need a refreshToken or a ksk_ key)",
+  "已从文件导入 ": "Imported ",
+  " 个凭证，忽略 ": " credentials, skipped ",
+  " 个（无效或重复）": " (invalid or duplicate)",
+  " 个凭证": " credentials",
+  " 个文件读失败": " files could not be read",
+  "自动识别失败：候选地区都没有响应，已保持 ": "Region detection failed: no candidate region responded. Kept ",
+  "自动识别失败: ": "Region detection failed: ",
+  "已自动识别地区: ": "Region detected: ",
+  "上一轮探活还没跑完，稍后再试": "The previous liveness check is still running. Try again shortly.",
+  "中转站配置已保存": "Relay settings saved",
+  "密钥不能为空": "The key cannot be empty",
+  "该密钥或 JSON 凭证已存在": "That key or JSON credential already exists",
+  "无法识别：请粘贴 ksk_ 密钥或 JSON 凭证（需含 refreshToken）": "Unrecognized. Paste a ksk_ key or a JSON credential that includes refreshToken.",
+  "已添加密钥": "Key added",
+  "已添加 ": "Added ",
+  " 个密钥，忽略 ": " keys, skipped ",
+  " 个密钥（含当前使用的密钥）并关闭网关。重新加载窗口后恢复 Kiro 默认服务。": " keys (including the one in use) and turned the gateway off. Reload the window to restore Kiro's own service.",
+  " 个密钥": " keys",
+  "没有可添加的密钥（无效或重复）。支持 ksk_ 或含 refreshToken 的 JSON。": "Nothing to add (invalid or duplicate). ksk_ keys and JSON with refreshToken are accepted.",
+  "已删除密钥": "Key deleted",
+  "已删除 ": "Deleted ",
+  "删除失败: 没有选中的密钥": "Delete failed: no key selected",
+  "已删除当前使用的密钥并关闭网关。重新加载窗口后恢复 Kiro 默认服务。": "Deleted the key in use and turned the gateway off. Reload the window to restore Kiro's own service.",
+  "删除失败: 未找到该密钥": "Delete failed: key not found",
+  "已切换密钥，立即生效": "Switched keys. It takes effect now.",
+  "已复制 JSON 凭证到剪贴板": "Copied the JSON credential",
+  "已复制完整密钥到剪贴板": "Copied the full key",
+  "复制失败: 未找到该密钥": "Copy failed: key not found",
+  "复制失败: ": "Copy failed: ",
+  "导出失败: 没有可导出的密钥": "Export failed: no key to export",
+  "已导出 ": "Exported ",
+  "导出失败: ": "Export failed: ",
+  "已开启地区自动识别，正在探测…": "Automatic region detection is on. Probing…",
+  "地区已自动识别: ": "Region detected: ",
+  "Region 已保存: ": "Region saved: ",
+  "请先添加 API Key 再识别地区": "Add an API key before detecting the region",
+  "网关已开启，面板和状态栏已经生效，可以接着用。Kiro 自带对话要重新加载窗口后才走你的 API Key。": "The gateway is on. The panel and status bar already show it. Reload the window before Kiro's own chat uses your API key.",
+  "网关已关闭，可以接着用。Kiro 自带对话要重新加载窗口后才恢复默认端点。": "The gateway is off. Reload the window before Kiro's own chat returns to the default endpoint.",
+  "自动续号配置已保存": "Auto-renew settings saved",
+  "已触发一次续号": "Started one renew round",
+  "续号失败: ": "Renew failed: ",
+  "已重置续号计数": "Renew counters reset",
+  "已导入 ": "Imported ",
+  " 个新 key": " new keys",
+  "没有可导入的新 key": "No new key to import",
+  "已丢弃 ": "Discarded ",
+  " 个待导入的 key": " keys that were waiting to be imported",
+  "已重置全部账号状态": "Account status reset",
+  "打开链接失败: ": "Could not open the link: ",
+  "统计已清零": "Stats reset",
+  "已复制日志到剪贴板": "Copied the log",
+  "官方 ksk_ 密钥直连 Kiro 服务": "Official ksk_ keys, straight to Kiro",
+  "转发到 Anthropic 格式的第三方中转站": "Forward to an Anthropic-format relay",
+  "选择工作模式": "Choose the route",
+  "当前：": "Current: ",
+  "Kiro Gateway: 还没有配置密钥，无法探活。": "Kiro Gateway: no key is configured, so liveness cannot run.",
+  "Kiro Gateway: 开始探活（每把密钥消耗一次生成请求）…": "Kiro Gateway: liveness check started (each key spends one generation request)…",
+  "Kiro Gateway: 上一轮探活还没跑完，稍后再试。": "Kiro Gateway: the previous liveness check is still running. Try again shortly.",
+  "Kiro Gateway 探活完成：可用 ": "Kiro Gateway liveness done: available ",
+  " · 禁用 ": " · disabled ",
+  " · 溢出 ": " · overage ",
+  " · 额度用尽 ": " · quota used up ",
+  " · 失效 ": " · invalid ",
+  " · 已删 ": " · removed ",
+  " 把": "",
+  "（.git / .vscode / .kiro/agents / .kiro/hooks / *.code-workspace / mcp.json 仍会逐项询问）": " (.git / .vscode / .kiro/agents / .kiro/hooks / *.code-workspace / mcp.json are still asked one by one)",
+  "Kiro Key 有效 · ": "Kiro key works · ",
+  "Kiro Key 测试失败: ": "Kiro key test failed: ",
+  "导入 ": "Imported ",
+  "暂存 ": "Held ",
+  " 个新 key，等你确认导入": " new keys, waiting for you to import",
+  "，跳过 ": ", skipped ",
+  " 个重复": " duplicates",
+  " 个验证不通过": " failed the check",
+  "号池暂无可用号": "The pool has no usable key right now",
+  " 秒后再看一次": "s, then check again",
+  "拉到的 ": "Fetched ",
+  " 个 key 全是重复，": " keys were all duplicates, ",
+  "冷却 ": "cooldown ",
+  " 秒": "s",
+  "连续失败 ": "",
+  " 次触发熔断，冷却 ": " failures in a row opened the breaker, cooldown ",
+  "没拿到可用的新 key": "No usable new key",
+  "，退避 ": ", backing off ",
+  " 秒后重试": "s before retry",
+  "已手动触发": "Triggered manually",
+  "出错: ": "Error: ",
+  "，": ", "
+};
+
+function uiLocale() {
+  const picked = String(get("language", "auto") || "auto");
+  if (picked === "zh" || picked === "en") return picked;
+  const lang = String((vscode.env && vscode.env.language) || "").toLowerCase();
+  return lang.startsWith("zh") ? "zh" : "en";
+}
+function tr(s) {
+  let text = s == null ? "" : String(s);
+  if (!text || uiLocale() !== "en") return text;
+  const keys = tr.keys || (tr.keys = Object.keys(HOST_EN).sort((a, b) => b.length - a.length));
+  for (const zh of keys) {
+    if (zh && text.includes(zh)) text = text.split(zh).join(HOST_EN[zh]);
+  }
+  return text;
+}
 
 function getMode() {
   return get("mode", MODE_OFFICIAL) === MODE_RELAY ? MODE_RELAY : MODE_OFFICIAL;
@@ -451,7 +578,7 @@ function isRelayMode() {
   return getMode() === MODE_RELAY;
 }
 function modeLabel() {
-  return MODE_LABEL[getMode()] || getMode();
+  return tr(MODE_LABEL[getMode()] || getMode());
 }
 async function setMode(mode) {
   const next = mode === MODE_RELAY ? MODE_RELAY : MODE_OFFICIAL;
@@ -463,11 +590,11 @@ function getRelayPorts() {
   const p = get("relayPorts", {}) || {};
   return { krs: Number(p.krs) || 19830, cps: Number(p.cps) || 19831 };
 }
-// 当前模式实际使用的端口。端点重定向、健康检查、服务器绑定都以它为准。
+// The port the current mode actually uses. Endpoint redirect, health checks, and server bind all follow it.
 function activePorts() {
   return isRelayMode() ? getRelayPorts() : getPorts();
 }
-// 中转站模式的全部配置，打包成一个对象交给 relay.js（它不认识 vscode 的配置 API）。
+// All relay-mode config, packed into one object for relay.js (it does not know vscode's configuration API).
 function relayPrefs() {
   return {
     baseUrl: get("relayBaseUrl", ""),
@@ -483,19 +610,19 @@ function relayPrefs() {
     promptCaching: get("relayPromptCaching", "auto"),
   };
 }
-// 当前模式的凭证齐了没有。官方直连要有 ksk_ 密钥，中转站要有地址 + Key；缺了就
-// 不去接管端点，免得 Kiro 的对话框变成一潭死水。
+// Whether the current mode's credentials are complete. Official direct needs a ksk_ key; relay needs an address plus a Key. If either is missing,
+// do not take over the endpoints, or Kiro's chat box becomes a dead pool.
 function credentialsReady() {
   return isRelayMode() ? relay.relayConfigured() : !!getApiKey();
 }
 
 // ---------------------------------------------------------------------------
-// JSON 凭证（OAuth refreshToken / accessToken）
+// JSON credentials (OAuth refreshToken / accessToken)
 //
-// 面板里可以粘贴 kiro-auth-token.json 或同类 JSON。存盘时 apiKeys 只留一个稳定
-// 的 json_<指纹> 占位，真正的 token 放在 globalState，刷新时身份不会跟着变。
-// Social / Desktop 走 prod.{region}.auth.desktop.kiro.dev/refreshToken；
-// 带 clientId+clientSecret 的走 AWS SSO OIDC。
+// The panel can paste kiro-auth-token.json or similar JSON. On disk, apiKeys keeps only one stable
+// json_<fingerprint> placeholder; the real token lives in globalState, so the identity does not change on refresh.
+// Social / Desktop go through prod.{region}.auth.desktop.kiro.dev/refreshToken;
+// ones with clientId+clientSecret go through AWS SSO OIDC.
 // ---------------------------------------------------------------------------
 const JSON_KEY_PREFIX = "json_";
 const JSON_REFRESH_SKEW_MS = 5 * 60 * 1000;
@@ -516,8 +643,8 @@ function getJsonCred(id) {
   const c = jsonCredsAll()[String(id || "")];
   return c && typeof c === "object" ? c : null;
 }
-// 多窗口时，选中项写到本机文件，占端口的窗口每次转发前读编号。
-// 只有本进程已经存着这把号的凭证才跟着换；没有就保持原号，不去刷新，也不判死。
+// With multiple windows, the selection is written to a local file, and the window that owns the port reads the index before each forward.
+// Switch only if this process already holds that account's credentials; otherwise keep the original account, do not refresh, and do not mark it dead.
 let _loggedSharedId = "";
 let _loggedMissingSharedId = "";
 function sharedActiveIdPath() {
@@ -628,8 +755,8 @@ function extractJsonCreds(value) {
   const visit = (node) => {
     if (Array.isArray(node)) { node.forEach(visit); return; }
     if (!node || typeof node !== "object") return;
-    // 账号导出包常见形态：accounts[].credentials 是对象而不是数组。
-    // 先把外壳字段和内层 credentials 合成一份再认，refreshToken 在哪一层都能吃到。
+    // A common shape of account-export bundles: accounts[].credentials is an object, not an array.
+    // Merge the outer fields with the inner credentials first, then recognize them, so refreshToken is picked up whichever layer it sits on.
     const merged = (node.credentials && typeof node.credentials === "object" && !Array.isArray(node.credentials))
       ? { ...node, ...node.credentials }
       : node;
@@ -708,8 +835,8 @@ function displayJsonKey(key) {
   const tail = String(key || "").slice(-4);
   return "JSON·" + tag + "·" + tail;
 }
-// 面板按 keys[].full 缓存账户用量。JSON 凭证的 full 是展示名，不是 json_ 内部 id，
-// 同步结果必须用同一把钥匙，否则套餐/积分对不上行。
+// The panel caches account usage under keys[].full. For a JSON credential, full is the display name, not the internal json_ id,
+// and sync results must use the same key or the plan and credits will not line up with the row.
 function panelFullKey(key) {
   return isJsonKey(key) ? displayJsonKey(key) : String(key || "");
 }
@@ -791,8 +918,8 @@ function httpsExchange(method, urlStr, headers, body, timeoutMs, attempt) {
         res.on("end", () => resolve({ statusCode: res.statusCode || 0, body: Buffer.concat(c).toString("utf8") }));
       }
     );
-    // 只有「TLS 还没建立」才重试。这种失败发生在 HTTP 正文写出之前，
-    // refreshToken 没有送到服务器，不会被轮换。超时、断线、已有 HTTP 响应都不重发。
+    // Retry only when TLS has not been established yet. That failure happens before the HTTP body is written out,
+    // so the refreshToken never reached the server and will not be rotated. Timeouts, disconnects, and an existing HTTP response are not resent.
     const fail = (e) => {
       const msg = e && e.message ? e.message : String(e || "");
       if (n < 3 && /before secure tls/i.test(msg)) {
@@ -856,9 +983,9 @@ async function refreshSocialCred(cred) {
   throw lastErr;
 }
 async function refreshIdcCred(cred) {
-  // Kiro 的 BuilderId / IdC 走 SSO OIDC CreateToken：POST /token，JSON，驼峰字段。
-  // application/x-www-form-urlencoded 会被这个接口当成非法请求，回
-  // 400 invalid_request（location/reason 为空的那条），刷新令牌本身并没有坏。
+  // Kiro's BuilderId / IdC uses SSO OIDC CreateToken: POST /token, JSON, camelCase fields.
+  // application/x-www-form-urlencoded is treated as an illegal request by this API and it returns
+  // 400 invalid_request (the one whose location/reason are empty); the refresh token itself is not bad.
   const regions = [...new Set([
     cred.region,
     regionFromProfileArn(cred.profileArn),
@@ -924,8 +1051,8 @@ async function resolveAuth(key) {
     try {
       next = isIdc ? await refreshIdcCred(cred) : await refreshSocialCred(cred);
     } catch (e) {
-      // 提前 5 分钟就刷新。这一步失败时，原来的 accessToken 往往还没过期，
-      // 不该让用量查询整段报「credential refresh failed」。
+      // Refresh 5 minutes early. If this step fails, the original accessToken often has not expired yet,
+      // and the usage query should not fail the whole call with "credential refresh failed".
       if (cred.accessToken && Number(cred.expiresAt) > Date.now()) {
         log("[JSON] 刷新失败，accessToken 尚未过期，先继续用: " + (e && e.message ? e.message : e));
         const auth = authFromCred(cred, k);
@@ -1016,9 +1143,9 @@ function applyProfileArnToBody(bodyBuf, profileArn) {
   j.profileArn = profileArn;
   return Buffer.from(JSON.stringify(j), "utf8");
 }
-// addIfMissing=false 时只改写已经存在的那个 profileArn，不会凭空补一个。转发
-// Kiro 自己发出的请求时要的就是这个：它把 profileArn 放在哪儿，我们就只换哪儿的
-// 值，别的位置一律保持原样。
+// When addIfMissing=false, only rewrite a profileArn that already exists; never invent one. When forwarding
+// a request Kiro itself sent, that is exactly what we want: wherever it put profileArn, we only replace the value there,
+// and every other position stays as it was.
 function applyProfileArnToUrl(rawUrl, profileArn, addIfMissing = true) {
   if (!profileArn) return rawUrl;
   const url = String(rawUrl || "");
@@ -1046,10 +1173,10 @@ function prepareOutbound(auth, bodyBuf, rawUrl) {
     return { body: stripProfileArnFromBody(body), url: stripProfileArnFromUrl(rawUrl) };
   }
   const nextBody = applyProfileArnToBody(body, auth.profileArn);
-  // profileArn 只该有一个落点。生成请求（POST awsJson）官方是放在 body 里的，
-  // body 已经带上之后再往查询串补一份，就成了官方从不发送的多余参数 —— 转发的
-  // 字节必须跟 Kiro 原本要发的一致，所以这时查询串只改写、不新增。没有 body 的
-  // REST GET 反过来只能靠查询串带。
+  // profileArn should have only one place to land. Official generate requests (POST awsJson) put it in the body.
+  // Adding another copy on the query string after the body already has it becomes an extra parameter the official client never sends — the forwarded
+  // bytes must match what Kiro originally meant to send, so here the query string is only rewritten, never added to. A request with no body,
+  // a REST GET, can only carry it on the query string.
   const bodyCarriesArn = nextBody !== body;
   return {
     body: nextBody,
@@ -1240,14 +1367,14 @@ function getRetryPrefs() {
     delayMs: Number.isFinite(delay) ? Math.min(Math.max(delay, 0), 60000) : 2000,
   };
 }
-// 无感自动切换密钥。
+// Seamless automatic key switching.
 const SWITCH_DEFAULT_COOLDOWN_MS = 5 * 60 * 1000;
 function getSwitchPrefs() {
   const cd = Math.round(Number(pref("switchCooldownMs", SWITCH_DEFAULT_COOLDOWN_MS)));
   return {
     enabled: pref("autoSwitch", true) !== false,
     cooldownMs: Number.isFinite(cd) ? Math.min(Math.max(cd, 0), 24 * 60 * 60 * 1000) : SWITCH_DEFAULT_COOLDOWN_MS,
-    // 均衡路由
+    // Balanced routing
     loadBalance: pref("loadBalance", true) !== false,
   };
 }
@@ -1265,20 +1392,20 @@ function managementBase() {
 }
 
 // ---------------------------------------------------------------------------
-// 生成平面端点表
+// Generate-plane endpoint table
 const GEN_ENDPOINTS = [
   { id: "q", label: "AmazonQ", base: (r) => "https://q." + r + ".amazonaws.com" },
   { id: "krs", label: "KiroKRS", base: (r) => runtimeBaseFor(r) },
 ];
-// 注意：不要给转发的请求补 x-amz-target。
+// Note: do not add x-amz-target onto a forwarded request.
 function genEndpointById(id) {
   return GEN_ENDPOINTS.find((e) => e.id === id) || GEN_ENDPOINTS[0];
 }
-// IDE 原生的生成平面。非生成类操作一律只走它。
+// The IDE's native generate plane. Non-generate operations always go only through it.
 function krsOnlyChain() {
   return [genEndpointById("krs")];
 }
-// 默认首选 krs。
+// krs is the default first choice.
 function getPreferredEndpointId() {
   const v = String(get("preferredEndpoint", "krs") || "krs").toLowerCase();
   return GEN_ENDPOINTS.some((e) => e.id === v) ? v : "krs";
@@ -1286,12 +1413,12 @@ function getPreferredEndpointId() {
 function getEndpointFallback() {
   return get("endpointFallback", true) !== false;
 }
-// 端点冷却默认 5 秒。
+// Endpoint cooldown defaults to 5 seconds.
 function getEndpointCooldownMs() {
   const v = Math.round(Number(get("endpointCooldownMs", 5000)));
   return Number.isFinite(v) ? Math.min(Math.max(v, 0), 30 * 60 * 1000) : 5000;
 }
-// 端点链允许走几轮，轮次之间退避多久。
+// How many rounds the endpoint chain may run, and how long to back off between rounds.
 function getEndpointRoundPrefs() {
   const rounds = Math.round(Number(get("endpointRounds", 2)));
   const delay = Math.round(Number(get("endpointRoundDelayMs", 1500)));
@@ -1300,7 +1427,7 @@ function getEndpointRoundPrefs() {
     delayMs: Number.isFinite(delay) ? Math.min(Math.max(delay, 0), 30000) : 1500,
   };
 }
-// 限流耐心模式。
+// Throttle patience mode.
 function getThrottlePatience() {
   const cap = Math.round(Number(get("throttleBackoffCapMs", 30000)));
   return {
@@ -1308,48 +1435,48 @@ function getThrottlePatience() {
     capMs: Number.isFinite(cap) ? Math.min(Math.max(cap, 1000), 300000) : 30000,
   };
 }
-// 指数退避的下一步等待时间：翻倍但不超过 cap。cur=0 时取 base。
+// Next wait for exponential backoff: double it, but not past cap. When cur=0, use base.
 function nextBackoffMs(cur, base, cap) {
   const next = cur > 0 ? cur * 2 : Math.max(base, 1);
   return Math.min(next, cap);
 }
-// 这次失败是不是"端点级限流"。
+// Whether this failure is endpoint-level throttling.
 function isThrottleFailure(status, text) {
   if (status === 429) return true;
-  // 传输层错误没有状态码；2xx 里也可能藏着限流错误帧（HTTP 200 + ThrottlingException）。
+  // A transport error has no status code; a 2xx can also hide a throttle error frame (HTTP 200 + ThrottlingException).
   if (!status || (status >= 200 && status < 300)) return THROTTLE_RE.test(String(text || ""));
   return false;
 }
-// 这次失败是不是"这个端点不认这个操作"（端点能力缺失，跟限流是两件事）。
+// Whether this failure means "this endpoint does not recognize this operation" (a missing endpoint capability, separate from throttling).
 const UNSUPPORTED_OP_RE = /unknownoperation|operation is not recognized/i;
 function isUnsupportedOperationFailure(status, text) {
-  // 只测文本、不卡状态码：上游有时先回 200 再在事件流里发错误帧。调用点传进来的
+  // Match the text only, and do not gate on the status code: upstream sometimes returns 200 and then sends an error frame in the event stream. What the call site passes in
   return UNSUPPORTED_OP_RE.test(String(text || ""));
 }
-// 这次失败是不是"上游临时故障"（可重试的 5xx）。
+// Whether this failure is a temporary upstream fault (a retryable 5xx).
 const TRANSIENT_SERVER_RE = /internalserver|internalfailure|serviceunavailable|badgateway|gatewaytimeout|502 bad gateway|503 service/i;
-// 传输层故障：请求根本没到达上游，或者连接在中途断了。
+// Transport failure: the request never reached upstream, or the connection dropped halfway.
 const TRANSPORT_FAILURE_RE = new RegExp([
-  "socket disconnected",            // TLS 握手前被掐（代理抖动的典型表现）
+  "socket disconnected",            // Cut off before the TLS handshake (the typical look of proxy jitter)
   "before secure tls",
   "econnreset", "econnrefused", "econnaborted",
   "epipe", "etimedout", "ehostunreach", "enetunreach", "enetreset",
-  "eai_again",                      // DNS 临时失败
+  "eai_again",                      // Temporary DNS failure
   "socket hang up",
-  "upstream timeout",               // 我们自己在 on("timeout") 里造的
+  "upstream timeout",               // One we synthesize ourselves inside on("timeout")
   "request timeout",
-  "tunneling socket could not be established", // 代理隧道建立失败
+  "tunneling socket could not be established", // The proxy tunnel failed to establish
 ].join("|"), "i");
 function isTransportFailure(text) {
   return TRANSPORT_FAILURE_RE.test(String(text || ""));
 }
 function isTransientServerFailure(status, text) {
   const s = Number(status) || 0;
-  // 明确的 5xx 状态码即可判定，不必看正文。
+  // A definite 5xx status code is enough to decide; no need to read the body.
   if (s >= 500 && s < 600) return true;
-  // 传输层故障没有状态码，只能靠错误文本认。
+  // A transport failure has no status code and can only be recognized from the error text.
   if (isTransportFailure(text)) return true;
-  // 上游有时先回 200 再在事件流里发错误帧，这时只能靠正文特征。
+  // Upstream sometimes returns 200 first and then sends an error frame in the event stream; then only signatures in the body work.
   return TRANSIENT_SERVER_RE.test(String(text || ""));
 }
 function getServerErrorRetryPrefs() {
@@ -1360,8 +1487,8 @@ function getServerErrorRetryPrefs() {
   };
 }
 
-// 已知的端点能力缺失。键是「端点 + 区域 + 操作」，因为同一端点在不同区能力不同。
-// 只放内存：重载窗口后重新探测，万一上游哪天补上了这个操作也能自动恢复。
+// Known missing endpoint capabilities. The key is "endpoint + region + operation", because the same endpoint differs by region.
+// Memory only: probe again after a window reload, so if upstream one day adds the operation it comes back on its own.
 const _endpointUnsupported = new Set();
 function unsupportedKey(id, region, op) {
   return String(id) + "|" + String(region || "") + "|" + String(op || "").toLowerCase();
@@ -1378,30 +1505,30 @@ function unsupportedSnapshot() {
 function resetEndpointUnsupported() {
   _endpointUnsupported.clear();
 }
-// 把已知不认这个操作的端点从链里剔掉，省掉一次注定失败的往返。
-// 绝不返回空链：全被剔掉时退回原链 —— 发出去拿到错误，也好过根本不发。
+// Drop endpoints already known not to recognize this operation, saving a round trip that is doomed to fail.
+// Never return an empty chain: if everything was dropped, fall back to the original chain — sending and getting an error beats not sending at all.
 function filterUnsupportedEndpoints(chain, region, op) {
   const keep = chain.filter((e) => !isEndpointUnsupported(e.id, region, op));
   return keep.length > 0 ? keep : chain;
 }
-// 端点回退的下一步决策。抽成纯函数是为了可测 —— 调度逻辑本身在闭包里，状态多，
-// 靠端到端复现代价太高。
-//   { action: "switch", index }              本轮还有没试过的端点，立刻换
-//   { action: "round", nextRound, delayMs }  本轮全撞上，退避后重走一轮
-//   { action: "giveup" }                     轮次用尽，交回调用方
-// skipIds：本次请求里已经探明"不支持当前操作"的端点，一律跳过。
+// The next decision for endpoint fallback. Pulled out as a pure function so it can be tested — the scheduler itself lives in a closure with a lot of state,
+// and reproducing it end to end costs too much.
+//   { action: "switch", index }              an untried endpoint remains this round; switch immediately
+//   { action: "round", nextRound, delayMs }  every endpoint was hit this round; back off, then walk the chain again
+//   { action: "giveup" }                     rounds are exhausted; hand control back to the caller
+// skipIds: endpoints already shown, during this request, not to support the current operation are always skipped.
 //
-// 能力缺失表是在请求开始时用来过滤 epChain 的，但请求进行中才探明的缺失只写进了
-// 表，epChain 已经定型。而"换轮"会清空 triedEndpoints，于是同一个请求里，已知不认
-// 这个操作的端点会被反复重选，每次都是注定的 400，纯浪费往返，限流场景下还在给
-// 速率桶添乱。所以换轮时也要落在"可用"的端点上，round 分支一并返回 index。
+// The capability-gap table filters epChain when the request starts, but a gap discovered mid-request is only written into
+// the table; epChain is already fixed. A new round clears triedEndpoints, so within the same request an endpoint already known not to
+// recognize this operation gets picked again and again, each time a doomed 400, pure wasted round trips, and under throttling it also
+// stirs the rate bucket. So a new round must land on an available endpoint too, and the round branch returns index as well.
 function planEndpointFallback(chain, triedIds, round, prefs, skipIds) {
   const skip = skipIds || new Set();
   const usable = [];
   for (let i = 0; i < chain.length; i++) {
     if (!skip.has(chain[i].id)) usable.push(i);
   }
-  // 链里每个端点都不支持这个操作：换端点这条路已经走不通了，别再空转。
+  // Every endpoint in the chain rejects this operation: switching endpoints is a dead end, so stop spinning.
   if (usable.length === 0) return { action: "giveup" };
   for (const i of usable) {
     if (!triedIds.has(chain[i].id)) return { action: "switch", index: i };
@@ -1409,8 +1536,8 @@ function planEndpointFallback(chain, triedIds, round, prefs, skipIds) {
   if (round >= prefs.rounds) return { action: "giveup" };
   return { action: "round", nextRound: round + 1, delayMs: prefs.delayMs, index: usable[0] };
 }
-// 端点冷却：某个端点刚因 429 失败过，后续请求直接从下一个端点起步，别再撞它。
-// 只放内存，重载窗口后重新探测。
+// Endpoint cooldown: an endpoint that just failed with 429 makes later requests start at the next one instead of hitting it again.
+// Memory only; probe again after a window reload.
 const _endpointCooldown = new Map(); // id -> untilMs
 function endpointCoolDown(id) {
   const ms = getEndpointCooldownMs();
@@ -1426,14 +1553,14 @@ function endpointCooldownLeft(id) {
 function endpointClearCooldown(id) {
   _endpointCooldown.delete(id);
 }
-// 本次请求要走的端点顺序：首选在前，其余按表序补齐。关掉回退时只留首选。
+// Endpoint order for this request: the preferred one first, then the rest in table order. With fallback off, only the preferred one remains.
 function genEndpointChain() {
   const preferred = getPreferredEndpointId();
   const head = GEN_ENDPOINTS.filter((e) => e.id === preferred);
   if (!getEndpointFallback()) return head;
   return [...head, ...GEN_ENDPOINTS.filter((e) => e.id !== preferred)];
 }
-// 起步端点下标：跳过还在冷却里的，全都在冷却就仍从 0 起（总比不发好）。
+// Starting endpoint index: skip ones still cooling down. If every one is cooling down, still start at 0 (better than not sending).
 function pickStartEndpointIndex(chain) {
   for (let i = 0; i < chain.length; i++) {
     if (endpointCooldownLeft(chain[i].id) === 0) return i;
@@ -1447,7 +1574,7 @@ function endpointStatusSnapshot() {
   }
   return out;
 }
-// 把当前生效的端点链打进日志，方便确认"现在到底走哪个端点"。
+// Log the endpoint chain currently in effect, so it is easy to confirm which endpoint we are actually on.
 function logEndpointChain() {
   const chain = genEndpointChain();
   const region = getRegion();
@@ -1493,8 +1620,8 @@ function log(...args) {
 // One-time, prominent marker the first time kiro-agent actually reaches each
 // local proxy plane. Both logs a user sent looked "healthy" (ports bound,
 // endpoints written) yet contained ZERO proxy traffic — meaning kiro-agent was
-// never routed through us. This marker makes "链路真的打通了" unmistakable in
-// the log, so "没走代理" vs "走了但上游报错" is obvious at a glance.
+// never routed through us. This marker makes "the path really went through" unmistakable in
+// the log, so "did not go through the proxy" vs "did, but upstream errored" is obvious at a glance.
 let _proxyHit = { KRS: false, CPS: false };
 function resetProxyHitMarkers() { _proxyHit = { KRS: false, CPS: false }; }
 function markProxyHit(label, req) {
@@ -1514,11 +1641,11 @@ function markProxyHit(label, req) {
 // Every counter updates LIVE, as it happens — nothing waits for the call to
 // finish:
 //   requests : incremented the moment a generation request is accepted.
-//   errors   : 只记「最终交回给 Kiro 的失败」。一次上游失败如果被自动切号
-//              （换下一把 key 重发）或自动重试接住了，Kiro 看到的仍是成功的
-//              回答，那次失败就不计入错误数 —— 否则无感切号会把错误数刷高，
-//              看起来像出了问题。没号可换的 429、上游 5xx、网络错误这些真的
-//              退回给 Kiro 的失败才计数。
+//   errors   : count only failures finally handed back to Kiro. If an upstream failure is caught by an automatic key switch
+//              (resend on the next key) or by an automatic retry, Kiro still sees a successful
+//              answer, and that failure is not counted — otherwise a seamless switch inflates the error count
+//              and it looks like something is wrong. A 429 with no account left to switch to, an upstream 5xx, a network error: only failures that are
+//              actually returned to Kiro are counted.
 //   credits  : added as soon as the upstream answers 2xx, using the model's
 //              rateMultiplier (the same number Kiro bills with) learned from
 //              the control plane's model list.
@@ -1536,10 +1663,10 @@ const STATS_FLUSH_MS = 3000;   // debounce for globalState writes
 const STATS_PUSH_MS = 250;     // throttle for the streaming byte counter
 const CHARS_PER_TOKEN = 4;     // rough tokenizer ratio for the estimate
 
-// 统计只统计"今天"：day 记录这批计数属于哪一天（本地日期），跨天后自动归零。
+// Stats count only "today": day records which local date this batch of counters belongs to, and they zero themselves after midnight.
 let _stats = { requests: 0, errors: 0, tokens: 0, credits: 0, since: 0, day: "" };
 let _statsInflight = 0; // open generation calls right now
-// Per-key breakdown ("个人消耗" in the panel): the same live counters, but
+// Per-key breakdown ("personal usage" in the panel): the same live counters, but
 // attributed to the key that actually served the request. Stored under a short
 // fingerprint of the key instead of the key itself, so globalState never holds
 // another plaintext copy of the secret.
@@ -1588,20 +1715,20 @@ function pruneKeyStats(keys) {
   }
   if (changed) flushStatsSoon();
 }
-// 本地日期键，用来判断"是不是还在同一天"。
+// Local date key, used to tell whether we are still on the same day.
 function todayKey(d = new Date()) {
   const p = (n) => String(n).padStart(2, "0");
   return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
 }
-// 今天 0 点的时间戳，作为当日统计的起点。
+// Timestamp of today at 00:00, the start of the day's stats.
 function startOfToday() {
   const d = new Date();
   d.setHours(0, 0, 0, 0);
   return d.getTime();
 }
-// 跨天就把总计数和每把密钥的计数一起归零。所有读取与写入统计的入口都会先调用
-// 它，因此无论是有流量、面板来拉取，还是定时器到点，都能保证看到的是当天数据。
-// 这里只改数据、不推送，避免和 pushStats 相互递归。
+// On a new day, zero both the totals and each key's counters. Every entry that reads or writes stats calls
+// this first, so whether there is traffic, the panel pulls, or the timer fires, what you see is today's data.
+// This only mutates the data and does not push, so it cannot recurse with pushStats.
 function ensureToday() {
   const today = todayKey();
   if (_stats.day === today) return false;
@@ -1611,11 +1738,11 @@ function ensureToday() {
   persistStatsNow();
   return true;
 }
-// 到了本地时间 0 点主动归零一次：没有流量、面板也没拉取时，显示同样会跟着翻页。
+// At local midnight, reset once on purpose: with no traffic and no panel pull, the display still rolls over.
 let _dayRolloverTimer = null;
 function scheduleDailyReset() {
   if (_dayRolloverTimer) clearTimeout(_dayRolloverTimer);
-  // 明天 0 点过 2 秒，留一点余量避开边界抖动。
+  // Two seconds past tomorrow's midnight, a little margin to avoid jitter right on the boundary.
   const delay = Math.max(startOfToday() + 24 * 60 * 60 * 1000 + 2000 - Date.now(), 1000);
   _dayRolloverTimer = setTimeout(() => {
     _dayRolloverTimer = null;
@@ -1637,7 +1764,7 @@ function loadStats() {
     tokens: posNum(s && s.tokens),
     credits: posNum(s && s.credits),
     since: posNum(s && s.since) || startOfToday(),
-    // 旧版本存下来的数据没有 day 字段，视为"不是今天"，加载后会被清零。
+    // Data saved by an older version has no day field. Treat it as "not today"; it is cleared after load.
     day: String((s && s.day) || ""),
   };
   const per = (extContext && extContext.globalState.get(KEY_STATS_STATE_KEY)) || null;
@@ -1757,13 +1884,13 @@ function operationName(req) {
 // Only agentic chat/generation calls consume credits. Inline completions and
 // other KRS chatter are counted as requests but cost nothing.
 const BILLED_OP_RE = /generateassistantresponse|sendmessage|converse/i;
-// 允许在端点之间轮换的操作。
+// Operations that are allowed to rotate across endpoints.
 //
-// 端点回退只对"两个平面都认的操作"成立。不可轮换的操作被改道过去只会白烧两次
-// 往返，最后把一个注定失败的错误交回 Kiro。实测矩阵（见 GEN_ENDPOINTS 上方）里
-// GenerateAssistantResponse 是唯一在 q. 和 krs、us-east-1 和 eu-central-1 四个组合
-// 上都可用的操作，所以只有它有资格轮换。converse 从未在日志里出现过，也没有实测
-// 数据，不放进来 —— 有需要时先测再加。
+// Endpoint fallback only holds for operations both planes recognize. Diverting a non-rotatable operation only burns two
+// round trips and finally hands Kiro an error that was doomed to fail. In the measured matrix (see above GEN_ENDPOINTS),
+// GenerateAssistantResponse is the only operation available on all four combinations of q. and krs, us-east-1 and eu-central-1,
+// so only it is eligible to rotate. converse has never shown up in the logs and there is no measured
+// data, so it stays out — measure it first if it is ever needed.
 const ROTATABLE_OP_RE = /generateassistantresponse/i;
 // Find the requested modelId anywhere in the (already parsed) request body.
 function findModelId(node, depth = 0) {
@@ -1801,9 +1928,9 @@ function modelIdFromBody(bodyBuf) {
 // --- Live counter updates -------------------------------------------------
 // A generation request was accepted and is on its way upstream.
 // `key` is the API key that serves the call, so the same event also lands in
-// that key's own bucket (个人消耗).
+// that key's own bucket (personal usage).
 function statsRequestStarted(inBytes, key) {
-  ensureToday(); // 跨天的第一笔请求不该累加到昨天的数字上
+  ensureToday(); // The first request of a new day must not be added onto yesterday's numbers
   const add = posNum(inBytes) / CHARS_PER_TOKEN;
   _stats.requests += 1;
   _stats.tokens += add;
@@ -1850,7 +1977,7 @@ function statsRequestFinished() {
   if (_statsInflight > 0) _statsInflight -= 1;
   pushStatsNow();
 }
-// 手动清零：把当天的计数清空，归属日期仍是今天。
+// Manual reset: clear today's counters. The owning date stays today.
 async function resetStats() {
   _stats = { requests: 0, errors: 0, tokens: 0, credits: 0, since: Date.now(), day: todayKey() };
   _keyStats = {};
@@ -1863,47 +1990,47 @@ async function resetStats() {
 }
 
 // ---------------------------------------------------------------------------
-// 无感自动切换密钥
+// Seamless automatic key switching
 // ---------------------------------------------------------------------------
-// 只有"这把 key 现在用不了"这类错误才触发切换：限流、鉴权失效、额度用尽。
-// 其它错误（网络抖动、上游 5xx）属于自动重试的范畴，不该浪费一把 key。
-// 限流文案。throttl 一条就覆盖了 ThrottlingException / throttled / throttling
-// 这一串写法；rate exceeded 是上游另一种回法，官方那套探测也认它。
+// Only errors of the kind "this key is unusable right now" trigger a switch: throttling, auth failure, quota exhausted.
+// Other errors (network jitter, upstream 5xx) belong to automatic retry and should not spend a key.
+// Throttle wording. One "throttl" covers ThrottlingException / throttled / throttling
+// and that whole family of spellings; "rate exceeded" is another way upstream phrases it, and the official probe recognizes it too.
 const THROTTLE_RE = /too many requests|throttl|rate ?limit|rate exceeded|slow down/i;
 const INVALID_RE = /access denied|unauthorized|invalid.{0,12}(api ?key|token)|token.{0,12}expired|forbidden/i;
 const QUOTA_RE = /quota|usage ?limit|limit ?(reached|exceeded)|exhaust|insufficient|out of credit|no credit/i;
-// 溢出上限（OVERAGE_EXCEEDED_RE）定义在探活那一节，跟 DEAD_KINDS 放在一起。
-// 下面的 keyFailureKind 会用到它 —— 都是运行时调用，取值时它早就初始化好了。
-// 账号被上游风控禁用。原文是「Your User ID is temporarily suspended. We detected
+// The overage cap (OVERAGE_EXCEEDED_RE) is defined in the liveness section, next to DEAD_KINDS.
+// keyFailureKind below uses it — those are all runtime calls, so it is long since initialized by the time it is read.
+// The account was suspended by upstream risk control. The original text is "Your User ID is temporarily suspended. We detected
 // unusual user activity and locked it as a security precaution. To restore
-// access, please contact our support team…」这种账号不会自己恢复，必须换号。
+// access, please contact our support team…" An account like this will not recover on its own; you have to switch accounts.
 //
-// 这里只认足够特异的短语。早先把 restore access / security precaution / locked
-// 之类各自单列成一条，任何报错正文里偶然出现一句就会把正常账号判成禁用，所以
-// 那些弱信号改成"必须成对出现"才算。
+// Only phrases specific enough are recognized here. Earlier, restore access / security precaution / locked
+// and the like each stood as their own rule, so one sentence that happened to appear in any error body would mark a healthy account suspended, so
+// those weak signals now count only when they must show up as a pair.
 const SUSPENDED_RE = /temporarily suspended|(?:user id|account)[^.\n]{0,40}\bsuspended\b/i;
 function looksSuspended(text) {
   const t = String(text || "");
   if (SUSPENDED_RE.test(t)) return true;
-  // 单独一句都可能出现在别的提示里，两个信号同时出现才下结论。
+  // Either sentence alone can appear in some other notice; conclude only when both signals show up together.
   return /unusual (?:user )?activity/i.test(t) && /security precaution/i.test(t);
 }
-// 禁用文案的「早期信号」。
+// Early signals in the suspension copy.
 //
-// 禁用提示是逐 token 流下来的，开头那几帧往往只够拼出「Your User ID is」这么
-// 几个词，真正的判定关键词（temporarily suspended）还在后面。命中这些前缀信号
-// 说明"这可能是一段禁用提示"，值得把判定窗口放宽几帧再决定 —— 一旦放行就再也
-// 没有透明换号的机会了。正常回答不含这些词，不受影响。
+// The suspension notice streams down token by token. The first few frames are often only enough to spell out "Your User ID is"
+// and a few words, while the real deciding keywords (temporarily suspended) are still ahead. Hitting these prefix signals
+// means this may be a suspension notice, so it is worth widening the decision window by a few more frames before deciding — once the stream is released there is
+// no second chance to switch accounts transparently. A normal answer does not contain these words and is unaffected.
 const SUSPENDED_HINT_RE = /your user id|\bsuspend|unusual (?:user )?activity|security precaution/i;
 function maybeSuspendedPrefix(text) {
   return SUSPENDED_HINT_RE.test(String(text || ""));
 }
-// 从流式回答里把正文拼回来。
+// Reassemble the body text out of a streaming answer.
 //
-// 上游有时不用错误码，而是拿 HTTP 200 把「账号被禁用」当成一段普通回答流回来
-// （Kiro 聊天窗里直接显示那段 temporarily suspended 提示）。这种响应是 AWS 的
-// event stream，正文被切成很多小帧逐 token 下发，关键词会跨帧断开，直接拿原始
-// 字节去匹配是匹配不到的 —— 所以先把各帧里的文本字段抽出来接成一整段再判断。
+// Upstream sometimes skips an error code and streams "account suspended" back as an ordinary answer over HTTP 200
+// (Kiro's chat window shows that temporarily suspended notice directly). This response is an AWS
+// event stream. The body is cut into many small frames and sent token by token, so a keyword breaks across frames, and matching the raw
+// bytes misses it — extract the text fields from each frame, join them into one string, then decide.
 function extractStreamText(raw) {
   const text = String(raw || "");
   let out = "";
@@ -1912,50 +2039,50 @@ function extractStreamText(raw) {
   while ((m = re.exec(text)) !== null) out += m[1];
   return out;
 }
-// 判定账号状态用的证据文本：原始字节 + 从各帧里抽出来接好的正文。
+// Evidence text used to judge account state: the raw bytes, plus the body reassembled from each frame.
 //
-// 两者缺一不可 —— 原始字节对付普通 JSON 错误体，拼回来的正文对付被切成小帧、
-// 关键词跨帧断开的流式回答。缓冲错误体那条分支如果只传原始字节，分帧的
-// 「temporarily suspended」就匹配不到，账号状态永远不被标记，面板一直显示「正常」。
+// Both are required — the raw bytes handle an ordinary JSON error body, and the reassembled body handles one cut into small frames
+// whose keywords break across frames. If the branch that buffers the error body passes only the raw bytes, a framed
+// "temporarily suspended" never matches, account state is never marked, and the panel keeps showing "healthy".
 function failureEvidence(raw) {
   const text = String(raw || "");
   return text + "\n" + extractStreamText(text);
 }
-// 判定前先攒够这么多字节：一帧 event stream 带着帧头和 payload，通常一个 chunk
-// 就够判了；万一 TCP 把开头切得很碎，就多等一个 chunk。
+// Buffer this many bytes before judging: one event-stream frame carries a frame header and a payload, and usually one chunk
+// is enough to judge. If TCP slices the start very fine, wait one more chunk.
 const HEAD_MIN_BYTES = 256;
-// 攒不够也不能一直等：上游在模型思考期间可能只发很小的心跳帧，超过这个时间就
-// 直接放行，最坏情况只给正常回答的首字节加这么点延迟。
+// Not having enough buffered is not a reason to wait forever: while the model is thinking, upstream may send only tiny heartbeat frames. Past this time,
+// release it directly. The worst case only adds this much delay to the first byte of a normal answer.
 const HEAD_WAIT_MS = 300;
-// 开头已经出现禁用文案的早期信号时改用这一组更宽的窗口，把关键词等齐。
-// 默认的 256 字节 / 300ms 只够收下帧头和头几个 token，禁用文案的
-// 「temporarily suspended」通常还没到 —— 窗口一关就直接放行，这把号从此
-// 不会被判成已禁用，也就永远不会自动换掉。
+// When an early signal of suspension copy has already appeared at the start, switch to this wider window and wait for the keywords to arrive.
+// The default 256 bytes / 300ms is only enough to take in the frame header and the first few tokens. The suspension copy's
+// "temporarily suspended" usually has not arrived yet — the moment the window closes, it is released, and from then on this account
+// is never judged suspended, and so is never switched away from automatically.
 const SUSPECT_MIN_BYTES = 4 * 1024;
 const SUSPECT_WAIT_MS = 2000;
-// 放行之后继续扫描正文的字节上限：攒到这么多还没命中就不再攒，避免长回答一直
-// 往内存里堆字符串。
+// Byte cap for keeping on scanning the body after release. Once this much is buffered with no hit, stop buffering, so a long answer does not keep
+// piling strings up in memory.
 const TAIL_SCAN_CAP = 64 * 1024;
-// 流里塞的错误帧。上游有时先回 200，再在 event stream 里发一个异常帧，Kiro 把它
-// 显示成「Something went wrong: [InternalServerException] …」。状态码是 200，所以
-// 光看状态码的话自动重试和自动切号都够不着这种失败。
+// An error frame stuffed into the stream. Upstream sometimes returns 200 first, then sends an exception frame in the event stream, and Kiro
+// displays it as "Something went wrong: [InternalServerException] …". The status code is 200, so
+// looking only at the status code, automatic retry and automatic key switching both cannot reach this kind of failure.
 //
-// 只认未转义的帧结构（":exception-type"、"__type"、"errorMessage"）：回答正文里
-// 的引号在 JSON 里是 \" 形态，所以哪怕用户正好在跟 AI 讨论
-// InternalServerException，也不会被当成错误帧。
+// Only recognize an unescaped frame structure (":exception-type", "__type", "errorMessage"): quotes in the answer body
+// appear as \" inside JSON, so even if the user happens to be talking with the AI about
+// InternalServerException, it is not treated as an error frame.
 const STREAM_ERROR_RE = /:exception-type|"__type"\s*:\s*"[^"]*(?:Exception|Error|Fault)|"errorMessage"\s*:\s*"/;
-// 流内错误帧对应的可匹配文本：没有错误帧就返回空串。
-// 返回的内容会交给重试规则和切号判定去匹配，所以要带上异常类型和错误消息。
+// Matchable text for an in-stream error frame. Return an empty string when there is no error frame.
+// What comes back is handed to the retry rules and the key-switch decision, so it has to carry the exception type and the error message.
 function streamErrorText(raw) {
   const text = String(raw || "");
   if (!STREAM_ERROR_RE.test(text)) return "";
   const type = exceptionName(text);
-  // 错误消息可能在 message / errorMessage 字段里，extractStreamText 会一并抽出。
+  // The error message may sit in a message / errorMessage field; extractStreamText pulls those out too.
   const detail = extractStreamText(text);
   const joined = (type + " " + detail).trim();
   return joined || text.slice(0, 500);
 }
-// 冷却时长按原因区分：限流是暂时的，失效/额度用尽/被禁用要压得更久。
+// Cooldown length depends on the reason: throttling is temporary; invalid, quota exhausted, and suspended are held much longer.
 const COOLDOWN_FACTOR = { throttle: 1, denied: 0.4, quota: 6, overage: 12, invalid: 12, suspended: 12 };
 const KIND_LABEL = {
   throttle: "被限流",
@@ -1966,22 +2093,22 @@ const KIND_LABEL = {
   invalid: "鉴权失效",
   suspended: "账号被禁用",
 };
-// 每种原因最终落到哪个账号状态上。被禁用是独立状态，面板单独显示「已禁用」，
-// 跟"密钥本身鉴权失效"不是一回事。
-// upstream 故意不映射状态：5xx 是上游自己的问题，跟这把号的好坏无关，不能因此
-// 给账号扣帽子。
-// overage 归到 quota 状态：对用户来说都是「额度用尽」，面板不必分两个词。内部保留
-// 独立的 kind 只是为了日志和删除原因能说清是 base 用完还是连 overage 都烧光了。
+// Which account state each reason finally lands on. Suspended is its own state, and the panel shows "suspended" on its own,
+// which is not the same thing as the key itself failing authentication.
+// upstream is deliberately left unmapped: a 5xx is upstream's own problem and says nothing about whether this account is good, so it must not
+// put a label on the account.
+// overage folds into the quota state: to the user both mean "quota exhausted", and the panel does not need two words for it. Internally we keep
+// a separate kind only so logs and the delete reason can say whether base ran out or even the overage was burned through.
 const KIND_TO_STATE = {
   denied: "denied", quota: "quota", overage: "quota", invalid: "invalid", suspended: "suspended",
 };
-// 软失败：换号重发值得试（不同号可能落到不同后端），但既不判死账号、也不按用户
-// 配置的冷却时长压 —— 那个时长是给"账号有问题"准备的，动辄几分钟，用在上游抖动
-// 上会把所有号一次性排除干净。
+// Soft failure: resending on another account is worth a try (different accounts may land on different backends), but do not mark the account dead and do not hold it for the
+// user-configured cooldown — that duration is for "something is wrong with the account" and is often several minutes. Using it on upstream jitter
+// would knock every account out at once.
 const SOFT_KINDS = new Set(["upstream"]);
 const SOFT_COOLDOWN_MS = 20 * 1000;
-// 宿主端日志用的状态中文名。内部仍然细分（冷却时长、切号决策要用到），只是
-// 对外呈现时会折叠成三种，见 publicState。
+// Chinese state names used in host-side logs. Internally we still subdivide them (cooldown length and the switch decision need that); only
+// the outward presentation collapses them into three. See publicState.
 const STATE_LABEL_HOST = {
   ok: "正常",
   denied: "被拒绝",
@@ -1990,56 +2117,56 @@ const STATE_LABEL_HOST = {
   suspended: "已禁用",
   unknown: "未检测",
 };
-// 判断上游的失败是否说明"这把 key 该换了"，返回原因或 null。
+// Decide whether an upstream failure means this key should be switched, and return the reason or null.
 //
-// 顺序上先看状态码这类硬证据，正文关键词只用来给状态码补充细节：光凭正文里
-// 出现 forbidden / quota 就换号并把账号判死，太容易冤枉正常账号（上游的 5xx
-// 错误页、回显的请求内容里都可能带上这些词）。
+// Look at hard evidence such as the status code first. Body keywords only fill in detail behind a status code: switching keys and marking the account dead just because the body
+// contains forbidden / quota is far too easy a way to condemn a healthy account (an upstream 5xx
+// error page, or request content echoed back, can all carry those words).
 function keyFailureKind(status, bodyText) {
   const text = String(bodyText || "");
-  // 禁用文案很特异，命中就可以直接认定，不用等状态码。
+  // Suspension copy is specific enough that a hit can be treated as certain, with no need to wait for a status code.
   if (looksSuspended(text)) return "suspended";
-  // 溢出上限同理，而且比状态码可靠：上游是用 HTTP 400 回它的，而 400 在下面会落到
-  // 关键词兜底，很容易被读成别的原因。这两个特征串一出现就说明号真废了，先认下来。
+  // The overage cap is the same, and more reliable than the status code: upstream returns it as HTTP 400, and a 400 falls through below into
+  // the keyword fallback, where it is easy to read as some other reason. The moment either of these signature strings appears, the account is truly dead, so accept it first.
   if (OVERAGE_EXCEEDED_RE.test(text)) return "overage";
   if (status === 402) return "quota";
-  // 429 要分两种情况，不能一律当限流。
+  // A 429 has to be split into two cases. It cannot all be treated as throttling.
   //
-  // 上游额度耗尽时也会回 429，光认状态码就会把"这个月配额用完了"判成"请求发太快
-  // 了"—— 前者得换号或者等重置，后者歇几分钟就好，结论正好相反，等错了就是白等。
-  // 所以先看正文里有没有额度字样，有就按额度用尽算。官方那套账号探测同样是把额度
-  // 判定排在限流前面的。
+  // Upstream also returns 429 when quota is exhausted. Trusting the status code alone would read "this month's quota is used up" as "requests are going out too fast"
+  // — the first needs a different account or a wait for reset, the second is fine after a few minutes, and the conclusions are opposites. Waiting for the wrong one is waiting for nothing.
+  // So look at the body for quota wording first, and if it is there, count it as quota exhausted. The official account probe likewise ranks the quota
+  // decision ahead of throttling.
   if (status === 429) return QUOTA_RE.test(text) ? "quota" : "throttle";
   if (status === 401) return "invalid";
   if (status === 403) {
-    // 403 既可能是密钥无效，也可能是额度用尽的另一种回法。
+    // A 403 can be an invalid key, or another way of saying the quota is exhausted.
     if (QUOTA_RE.test(text)) return "quota";
     if (INVALID_RE.test(text)) return "invalid";
-    // 原因不明的 403 不再当成"跟密钥无关"直接放过去 —— 上游在额度耗尽、风控
-    // 限流、区域不匹配时都可能回一个不带任何线索的 403，把它原样交回 Kiro 只会
-    // 让这轮对话直接失败。按"这把号暂时用不了"处理：换号重发 + 短冷却，但不判死
-    // （denied 不是终态，冷却过去自己就恢复），所以误判的代价只是几分钟不被选中。
+    // A 403 with no clear reason is no longer waved through as "unrelated to the key" — upstream may return a 403 with no clue at all when quota is exhausted, risk control
+    // is throttling, or the region does not match. Handing it back to Kiro as-is just
+    // fails this turn of the conversation outright. Treat it as "this account is unusable for now": switch accounts and resend, plus a short cooldown, but do not mark it dead
+    // (denied is not terminal; it comes back on its own once the cooldown passes), so the cost of a wrong call is only a few minutes of not being selected.
     return "denied";
   }
-  // 传输层错误（status=0）：网线断了、DNS 挂了，换号也一样不通，只有正文明确
-  // 说限流才换。
+  // A transport error (status=0): the link is down or DNS is dead, and switching accounts will not get through either. Switch only when the body explicitly
+  // says throttling.
   if (!status) {
     if (THROTTLE_RE.test(text)) return "throttle";
     return null;
   }
-  // 上游 5xx（500 / 502 / 503 / 504）：先看是不是被限流包装成了 5xx，否则按软
-  // 失败处理 —— 换一把号重发往往就通了，同时只压 20 秒的短冷却，不改账号状态。
+  // An upstream 5xx (500 / 502 / 503 / 504): first see whether throttling was wrapped as a 5xx; otherwise treat it as a soft
+  // failure — resending on another account often gets through, and only a short 20-second cooldown is applied, with no change to account state.
   if (status >= 500) {
     if (THROTTLE_RE.test(text)) return "throttle";
     return "upstream";
   }
-  // 2xx 一律不得推出「鉴权失效」。
+  // A 2xx must never be taken to mean authentication failed.
   //
-  // 上游回了 2xx 就说明这次请求的凭证是通过鉴权的 —— 从这种响应里读出"密钥失效"
-  // 在逻辑上自相矛盾。而下面那段纯关键词兜底会命中 INVALID_RE 里的 forbidden /
-  // unauthorized / access denied，于是 HTTP 200 + 错误帧（或者用户正好在跟 AI
-  // 讨论 403）就能把一把健康的密钥判成已失效，而且这是终态、会被冻结、不再探测。
-  // 2xx 下只保留两种结论：禁用文案（上面已经判过）和明确的限流。
+  // A 2xx from upstream means this request's credentials passed authentication — reading "key invalid" out of such a response
+  // is a contradiction. The pure keyword fallback below would hit forbidden /
+  // unauthorized / access denied inside INVALID_RE, so an HTTP 200 plus an error frame (or the user happening to be talking to the AI
+  // about a 403) could mark a healthy key invalid, and that is terminal: it gets frozen and is never probed again.
+  // Under a 2xx only two conclusions are kept: suspension copy (already decided above) and an explicit throttle.
   if (status >= 200 && status < 300) {
     if (THROTTLE_RE.test(text)) return "throttle";
     return null;
@@ -2049,54 +2176,54 @@ function keyFailureKind(status, bodyText) {
   if (INVALID_RE.test(text)) return "invalid";
   return null;
 }
-// key -> { until, kind }。只放在内存里：重载窗口后重新探测比记着一份可能过期的
-// 黑名单更安全。
+// key -> { until, kind }. Memory only: probing again after a window reload is safer than keeping a
+// blacklist that may already be stale.
 const _keyCooldown = new Map();
-// 账号健康状态。key -> { state, at }，state 取值：
-//   ok        正常，可以用
-//   quota     额度用尽（积分已跑满，或上游明确这么说）
-//   invalid   已失效（鉴权被拒）
-//   suspended 账号被上游禁用
-//   unknown   还没探测过，或只是网络问题导致探测失败
-// 来源有两处：账户信息同步的结果，以及真实请求的成败。
+// Account health. key -> { state, at }. state is one of:
+//   ok        healthy, usable
+//   quota     quota exhausted (credits are maxed out, or upstream says so explicitly)
+//   invalid   invalid (authentication was refused)
+//   suspended the account was suspended by upstream
+//   unknown   not probed yet, or the probe failed only because of the network
+// Two sources: the result of syncing account info, and whether a real request succeeded or failed.
 const _keyHealth = new Map();
-// 终态：这三种都是"账号本身有问题"，不会自己好转。一旦判定就冻结下来 ——
-// 不再重复探测，也不被后续的网络抖动改写，一直保持到密钥被删除或用户手动重置。
+// Terminal states: all three mean something is wrong with the account itself, and it will not get better on its own. Once decided, freeze it —
+// do not probe it again, and do not let later network jitter overwrite it, until the key is deleted or the user resets the state by hand.
 const TERMINAL_STATES = new Set(["invalid", "quota", "suspended"]);
 function isTerminalState(state) {
   return TERMINAL_STATES.has(String(state || ""));
 }
-// 终态的复检窗口：到点之后自动解冻，让这把号重新参与挑号和探测。
+// Recheck window for a terminal state: once it is due, unfreeze automatically so the account joins selection and probing again.
 //
-// 早先终态是"永久"的，结果 quota 变成了一个死锁：额度用尽 → 冻结 → 挑号跳过它、
-// 账户同步也跳过它（省一次往返）→ 于是永远拿不到"额度已经恢复"的新数据 → 永远
-// 解不了冻。可 Kiro 的额度本来就是按周期重置的，这是个暂时状态，不该判死。
-//   quota     3 小时后复检一次。重置周期通常比这更长，多探几次的代价只是一次
-//             很轻的 GET，换来的是额度一恢复就能自动接着用。
-//   invalid   密钥真被吊销确实不会自己好，但"跨区拒绝、上游鉴权抖动"长得一模
-//             一样，留一个 12 小时后复核的机会，避免一次误判就把号永久废掉。
-//   suspended 风控锁号要人工申诉，自动复检没有意义，保持永久冻结。
+// Terminal states used to be permanent, and quota became a deadlock: quota exhausted → frozen → selection skips it and
+// account sync skips it too (saving a round trip) → so we never get fresh data saying the quota has recovered → it can
+// never unfreeze. But Kiro quota resets on a cycle. This is a temporary state and should not be a death sentence.
+//   quota     recheck once after 3 hours. The reset cycle is usually longer than that; a few extra probes cost only one
+//             very cheap GET, and in return the account is used again the moment quota recovers.
+//   invalid   a key that was truly revoked will not heal itself, but a cross-region refusal and upstream auth jitter look exactly
+//             the same. Leave a chance to recheck after 12 hours, so one wrong call does not retire the account forever.
+//   suspended a risk-control lock needs a human appeal. An automatic recheck is pointless, so it stays frozen permanently.
 const FREEZE_TTL_MS = { quota: 3 * 60 * 60 * 1000, invalid: 12 * 60 * 60 * 1000 };
-// 这个终态什么时候到期。返回 0 表示永久冻结。hint 是调用方给的确切到期时间
-// （比如从用量接口解析出的额度重置时间），比默认 TTL 更准就用它。
+// When this terminal state expires. Returning 0 means frozen forever. hint is an exact expiry the caller supplies
+// (for example a quota reset time parsed from the usage API); use it when it is more accurate than the default TTL.
 function freezeExpiresAt(state, hint) {
   const ttl = FREEZE_TTL_MS[state];
   if (!ttl) return 0;
   const at = Number(hint) || 0;
   return at > Date.now() ? at : Date.now() + ttl;
 }
-// 这把 key 的状态是否还处于冻结中（终态且没到复检时间）。
-// 顺手做到期解冻：这个函数在挑号热路径上被反复调用，把解冻放在这里，任何一条
-// 用到"这把号能不能用"的路径都会自动获得复检能力，不用各处再判一次。
-// opts.silent: 解冻后不要回推面板。给 keyStatusSnapshot / setKeyHealth 用 ——
-// 它们本来就在生成快照或紧接着自己会推一次，这里再推一次就成了嵌套调用
-// （pushStats → keyStatusSnapshot → keyHealthFrozen → pushStats …）。
+// Whether this key's state is still frozen (terminal, and the recheck time has not arrived).
+// Unfreeze on expiry while we are here. This function is called over and over on the hot key-selection path, so putting the unfreeze here means any
+// path that asks "can this account be used" gets recheck behavior, with no extra check scattered around.
+// opts.silent: after unfreezing, do not push back to the panel. Used by keyStatusSnapshot / setKeyHealth —
+// they are already building a snapshot, or they push once themselves right after, and another push here becomes a nested call
+// (pushStats → keyStatusSnapshot → keyHealthFrozen → pushStats …).
 function keyHealthFrozen(key, opts = {}) {
   const h = _keyHealth.get(key);
   if (!h || !isTerminalState(h.state)) return false;
   if (!h.until || h.until > Date.now()) return true;
-  // 复检窗口到了：清掉旧结论。真的还是坏的，下一次探测或请求会把它重新判回来，
-  // 代价只是一次往返。
+  // The recheck window is due: drop the old conclusion. If it really is still bad, the next probe or request will judge it again,
+  // at the cost of one round trip.
   _keyHealth.delete(key);
   saveKeyHealthSoon();
   log("账号状态复检: " + maskKey(key) + " 的「" + (STATE_LABEL_HOST[h.state] || h.state)
@@ -2104,19 +2231,19 @@ function keyHealthFrozen(key, opts = {}) {
   if (!opts.silent && panelProvider) panelProvider.pushStats();
   return false;
 }
-// opts.force: 允许改写终态。只有两种情况给 force —— 这把 key 真的跑成功了
-// （最硬的证据，用来自我纠正误判），以及用户手动重置状态。
-// opts.until: 终态的确切到期时间，没给就按 FREEZE_TTL_MS 算。
+// opts.force: allow overwriting a terminal state. force is granted in only two cases — this key actually ran a request successfully
+// (the hardest evidence, used to correct a wrong call), and the user reset the state by hand.
+// opts.until: the exact expiry of the terminal state. If omitted, compute it from FREEZE_TTL_MS.
 function setKeyHealth(key, state, opts = {}) {
   if (!key || !state) return;
-  // 先给过期的终态一次解冻机会：否则一把已经过了复检窗口的号会被旧结论挡在
-  // 门外，新探测到的结果根本写不进来。这里不用它回推面板，下面自己会推。
+  // Give an expired terminal state one chance to unfreeze first. Otherwise an account that is already past its recheck window stays blocked by the old conclusion,
+  // and a newly probed result can never be written in. Do not push the panel from here; the code below pushes itself.
   keyHealthFrozen(key, { silent: true });
   const prev = _keyHealth.get(key);
-  // 这里只负责记状态，不负责删号。删除统一走探活那一节（runLivenessScan →
-  // deleteKeyAutomatic）：那条路径的依据是真发一次请求拿回来的响应，比在这里凭
-  // 用量接口的 used >= total 推断可靠得多 —— POWER 这类号 base 用超之后还有
-  // overage 余量，照样能跑，用量却已经显示 10508/10000 了，照它删就是丢好号。
+  // This only records state. It does not delete accounts. Deletion goes through the liveness section (runLivenessScan →
+  // deleteKeyAutomatic): that path is based on the response from a request we actually sent, which is much more reliable than inferring here from
+  // used >= total on the usage API — a POWER-style account still has
+  // overage left after base is exceeded and can still run, yet usage already shows 10508/10000. Deleting on that number throws away a good account.
   if (prev && isTerminalState(prev.state) && !opts.force) return;
   if (prev && prev.state === state) return;
   const entry = { state, at: Date.now() };
@@ -2128,76 +2255,76 @@ function setKeyHealth(key, state, opts = {}) {
   saveKeyHealthSoon();
   if (panelProvider) panelProvider.pushStats();
 }
-// 账户同步的结果换算成健康状态。
+// Turn an account-sync result into a health state.
 //
-// 这里只在证据够硬的时候才下结论：状态码是主依据，正文关键词只用来区分同一个
-// 状态码背后的不同原因。早先的做法是拿错误信息整段去套 /\b(401|403)\b/ 这类
-// 正则，正文里随便出现一个 403 数字、一句 forbidden，正常账号就被判成已失效，
-// 而且一判就再也不会翻案。
+// Conclude here only when the evidence is hard enough: the status code is the main basis, and body keywords only distinguish different reasons behind the same
+// status code. The old approach ran the whole error message against a regex like /\b(401|403)\b/. A stray 403 digit in the body, or one "forbidden",
+// and a healthy account was marked invalid,
+// and once marked it was never reversed.
 function noteAccountHealth(key, ok, info, err) {
   if (ok) {
     const used = Number(info && info.used);
     const total = Number(info && info.total);
     const exhausted = Number.isFinite(used) && Number.isFinite(total) && total > 0 && used >= total;
-    // 用量先存下来：挑号时要靠它把请求优先分给额度富裕的号。
+    // Save the usage first: key selection uses it to prefer accounts with plenty of quota left.
     noteKeyUsage(key, info);
     const prev = _keyHealth.get(key);
-    // 唯一不能靠"查得到用量"翻案的是被禁用：账号被风控锁掉往往只挡推理接口，
-    // 用量查询照样回 200。要给禁用翻案，得靠这把号真跑通一次请求
-    // （clearCooldown），或者用户手动重置状态。
+    // The one case that cannot be reversed just because usage is readable is suspension: a risk-control lock often blocks only the inference API,
+    // while the usage query still returns 200. To reverse a suspension, this account has to actually complete a request
+    // (clearCooldown), or the user has to reset the state by hand.
     if (prev && prev.state === "suspended") {
       maybeAdoptUsableKey();
       return;
     }
-    // 其余情况下拿到真实账户数据是最可靠的一手信息，允许推翻之前的终态判定
-    // （之前误判成已失效的号就是靠这里自己纠正回来的）。
-    // 额度用尽时，若用量接口给了确切的重置时间就拿它当复检时间，比默认 TTL 准。
+    // In every other case, real account data is the most reliable first-hand information, and it is allowed to overturn an earlier terminal verdict
+    // (accounts previously misjudged as invalid correct themselves here).
+    // When quota is exhausted, if the usage API gave an exact reset time, use that as the recheck time. It is more accurate than the default TTL.
     setKeyHealth(key, exhausted ? "quota" : "ok", { force: true, until: info && info.resetAt });
     maybeAdoptUsableKey();
     return;
   }
   const status = Number(err && err.status) || 0;
-  // 正文优先用响应体，退化到 Error.message（里面也带了截断的响应体）。
+  // Prefer the response body for the text, and fall back to Error.message (which also carries a truncated response body).
   const text = String((err && (err.body || err.message)) || err || "");
-  // 禁用文案很特异，命中就直接认定。
+  // Suspension copy is specific enough that a hit is accepted directly.
   if (looksSuspended(text)) { setKeyHealth(key, "suspended"); scheduleDeadDrop(key, "suspended"); }
-  // 溢出上限的 reason 常量比状态码可靠，先认它（上游用 400 回它，会落到后面的兜底里
-  // 被读成别的原因）。base + overage 都烧光了，跟额度用尽归一个状态。
+  // The overage-cap reason constant is more reliable than the status code, so accept it first (upstream returns it as 400, and it would fall into the later fallback
+  // and be read as some other reason). Once both base and overage are burned through, it shares a state with quota exhausted.
   else if (OVERAGE_EXCEEDED_RE.test(text)) { setKeyHealth(key, "quota"); scheduleDeadDrop(key, "overage"); }
-  // 429 也要先过一遍额度文案：额度耗尽时上游同样回 429，先认状态码会把"配额用完"
-  // 判成"发太快了"。跟 keyFailureKind 里的顺序保持一致。
+  // A 429 also has to pass the quota wording first: when quota is exhausted, upstream returns 429 as well, and accepting the status code first would read "quota used up"
+  // as "sending too fast". Keep the same order as in keyFailureKind.
   else if (status === 402 || ((status === 403 || status === 429) && QUOTA_RE.test(text))) {
     setKeyHealth(key, "quota");
-    // 402 / 403 是明确拒绝，可以据此清号。429 只标状态不删 —— 它本质是限流，而巡检
-    // 是并发打管理端点的，本身最容易撞 429，正文里带一句 quota 不足以断定额度真用完。
+    // 402 / 403 are explicit refusals and can be used to retire the account. A 429 only sets a status and does not delete — it is throttling at heart, and the sweep
+    // hits management endpoints concurrently, which is the easiest way to bump into a 429. One "quota" in the body is not enough to conclude the quota is truly gone.
     if (status !== 429) scheduleDeadDrop(key, "quota");
   }
   else if (status === 401) setKeyHealth(key, "invalid");
   else if (status === 403) {
-    // 403 不一定代表密钥坏了：正文明确说鉴权被拒才判失效。看不出原因就保留原
-    // 结论 —— 这个接口不给用说明不了账号状态，把本来判定正常的号降级成「未检测」
-    // 只会让人以为出了问题。
+    // A 403 does not necessarily mean the key is bad: mark it invalid only when the body explicitly says authentication was refused. If the reason cannot be seen, keep the previous
+    // conclusion — this API refusing us says nothing about account state, and downgrading an account that was judged healthy to "not checked"
+    // only makes it look like something is wrong.
     if (INVALID_RE.test(text)) setKeyHealth(key, "invalid");
   }
-  // 限流是一个真结论，不是"没查出来"，所以要记下来让面板显示「限流中」；但只记，
-  // 不排除 —— 不压 key 冷却、不改账号状态。
+  // Throttling is a real conclusion, not "we could not find out", so record it and let the panel show "throttled". But only record it;
+  // do not exclude the key — no key cooldown, and no change to account state.
   //
-  // 早先这里压的是 coolDownKey(key, "throttle")，那会让 keyIsUsable 返回 false，把
-  // 一把其实健康的号从挑号里踢出去 5 分钟。而巡检是并发打管理端点的，本身最容易撞
-  // 429，一撞就排除的话可能一次性废掉大半号池。项目其余三条路径（端点回退、流内
-  // 错误、推理探活）也都刻意不把 429 当账号问题，这里保持一致。
+  // What used to be applied here was coolDownKey(key, "throttle"), which makes keyIsUsable return false and kicks
+  // a key that is actually healthy out of selection for 5 minutes. The sweep hits management endpoints concurrently and is itself the most likely to hit a
+  // 429. Excluding on every hit could retire most of the pool at once. The other three paths in this project (endpoint fallback, in-stream
+  // errors, and inference liveness) also deliberately refuse to treat a 429 as an account problem. Stay consistent here.
   else if (status === 429) {
     noteKeyThrottled(key);
     return;
   }
-  // 上游 5xx、超时、网络错误说明不了账号本身的状态：保留原结论。
+  // An upstream 5xx, a timeout, or a network error says nothing about the account itself: keep the previous conclusion.
   else if (status >= 500 || !status) return;
   else setKeyHealth(key, "unknown");
   maybeAdoptUsableKey();
 }
-// 当前选中的密钥已经不可用时，主动换一把可用的，不必等下一次请求撞墙才切。
-// 账户同步刚给出结论、或用户新增/删除密钥后都会走一次，新加进来的密钥因此能
-// 立刻接手。
+// When the currently selected key is already unusable, switch to an available one on our own, instead of waiting for the next request to hit the wall.
+// This runs after account sync has just produced a conclusion, and after the user adds or deletes a key, so a newly added key can
+// take over immediately.
 function maybeAdoptUsableKey() {
   if (!getSwitchPrefs().enabled) return;
   const active = getActiveApiKey();
@@ -2205,14 +2332,14 @@ function maybeAdoptUsableKey() {
   const next = rankUsableKeys([active])[0];
   if (!next) return;
   const h = _keyHealth.get(active);
-  // 状态名（quota / invalid / …）用宿主端那份映射翻译，别再借 KIND_LABEL：两者
-  // 只是恰好有几个同名键，加一个新状态就会显示成 undefined。
+  // Translate state names (quota / invalid / …) with the host-side map. Do not borrow KIND_LABEL: the two
+  // merely happen to share a few key names, and adding a new state would display as undefined.
   log("自动切换密钥: 当前 " + maskKey(active) + " "
     + (STATE_LABEL_HOST[h && h.state] || "不可用") + " → 换用 " + maskKey(next));
   adoptKey(next);
 }
-// 密钥被删除或重新添加时，清掉它残留的状态。否则删掉再加回同一把 key，会继承
-// 之前的"已失效 / 额度用尽 / 已禁用"结论，从此再也不会被自动切号选中。
+// When a key is deleted or added again, clear the state it left behind. Otherwise deleting and adding the same key back inherits
+// the previous "invalid / quota exhausted / suspended" conclusion, and automatic switching will never select it again.
 function forgetKeyHealth(keys) {
   const list = Array.isArray(keys) ? keys : [keys];
   let changed = false;
@@ -2220,8 +2347,8 @@ function forgetKeyHealth(keys) {
     if (!k) continue;
     if (_keyHealth.delete(k)) changed = true;
     if (_keyCooldown.delete(k)) changed = true;
-    // 挑号用的那几份缓存一起清掉：密钥都删了还留着用量和探测时间，既没意义也是
-    // 一份长不掉的内存。
+    // Clear the caches key selection uses at the same time: once the key is gone, keeping usage and probe times is pointless and is
+    // memory that never shrinks.
     _keyUsage.delete(k);
     _keyLastUsedAt.delete(k);
     _keyProbeAt.delete(k);
@@ -2231,8 +2358,8 @@ function forgetKeyHealth(keys) {
   saveKeyHealthSoon();
   if (panelProvider) panelProvider.pushStats();
 }
-// 终态要跨窗口保留，否则重载一次就又从"未检测"开始，已经确认坏掉的号会被重新
-// 探测一遍。落盘的是密钥指纹，globalState 里不会多存一份明文密钥。
+// A terminal state has to survive across windows, or one reload starts over from "not checked" and an account already confirmed bad is
+// probed all over again. What is persisted is the key fingerprint; globalState does not store another copy of the key in plaintext.
 const KEY_HEALTH_STATE_KEY = "kiroGateway.keyHealth";
 let _keyHealthSaveTimer = null;
 function saveKeyHealthSoon() {
@@ -2247,13 +2374,13 @@ async function saveKeyHealth() {
   const out = {};
   for (const [key, h] of _keyHealth) {
     if (!h || !isTerminalState(h.state)) continue;
-    // 复检时间一起存：不然重载窗口就等于把复检窗口重新计时，一把快到期的号会
-    // 被又冻上一整轮。
+    // Store the recheck time too. Otherwise reloading the window restarts the recheck window, and an account that was about to expire
+    // gets frozen for another full round.
     out[keyFingerprint(key)] = { state: h.state, at: h.at || Date.now(), until: h.until || 0 };
   }
   try { await extContext.globalState.update(KEY_HEALTH_STATE_KEY, out); } catch {}
 }
-// 启动时恢复终态。只认现存密钥的指纹，已删除的条目顺手丢掉。
+// Restore terminal states at startup. Only accept fingerprints of keys that still exist; drop entries for deleted ones along the way.
 function loadKeyHealth() {
   if (!extContext) return;
   let saved = null;
@@ -2265,8 +2392,8 @@ function loadKeyHealth() {
     const e = saved[keyFingerprint(key)];
     if (!e || !isTerminalState(e.state)) continue;
     const state = String(e.state);
-    // until 缺失的是旧版本存下来的永久终态。quota / invalid 现在都带复检窗口，
-    // 给它们补一个：否则升级前被判死的号永远翻不了案。
+    // A missing until is a permanent terminal state saved by an older version. quota / invalid now both have a recheck window,
+    // so give them one. Otherwise an account marked dead before the upgrade can never be reversed.
     let until = Number(e.until) || 0;
     if (!until) until = freezeExpiresAt(state, 0);
     if (until && until <= Date.now()) { expired++; continue; }
@@ -2277,36 +2404,36 @@ function loadKeyHealth() {
   }
   if (expired) log("已跳过 " + expired + " 个账号的过期终态判定，它们重新参与挑号");
   if (restored) log("已恢复 " + restored + " 个账号的终态（已失效 / 额度用尽 / 已禁用）");
-  // 落盘一次，把已删除密钥的残留条目清出去。
+  // Persist once, to flush leftover entries for deleted keys.
   saveKeyHealthSoon();
 }
-// 用户手动重置：连冷却带健康状态一起清空，所有密钥回到"未检测"，下一次同步或
-// 请求重新给结论。终态就是靠这个出口翻案的。
+// Manual user reset: clear cooldown and health state together. Every key goes back to "not checked", and the next sync or
+// request produces a fresh conclusion. A terminal state is reversed through this exit.
 function resetKeyHealth() {
   _keyCooldown.clear();
   _keyHealth.clear();
-  // 探测时间也清掉：用户点了重置就是要立刻重新判定，不该被"4 分钟内不重复探测"
-  // 的节流挡住。用量数据留着无害，它只影响挑号顺序，下一轮探测会覆盖。
+  // Clear probe times too: the user hit reset because they want an immediate re-judgment, and it must not be blocked by the "do not probe again within 4 minutes"
+  // throttle. Leaving the usage data is harmless; it only affects selection order, and the next probe overwrites it.
   _keyProbeAt.clear();
-  // 限流标记属于状态判定，重置一起清。
+  // The throttle mark is part of the state judgment, so the reset clears it too.
   _keyThrottledAt.clear();
-  // 「刚删过的坏号」记忆一起清掉。重置的语义就是全部翻案，这个记忆不清的话，用户
-  // 想把那把号重新收回来会被号池当成重复号挡掉。
+  // Clear the memory of "bad accounts just deleted" as well. Reset means every verdict is overturned. If this memory stays, and the user
+  // tries to take that account back, the pool treats it as a duplicate and blocks it.
   _deadKeyAt.clear();
   saveKeyHealthSoon();
-  // 重置后马上跑一轮巡检，面板上的「未检测」很快就会有结论。
+  // Run a sweep right after the reset, so the panel's "not checked" gets a conclusion quickly.
   healthSweepOnce().catch(() => {});
 }
-// 一把 key 现在能不能用：冷却中不能用，已失效 / 额度用尽 / 已禁用也不能用。
-// "未知"仍然算可用 —— 没探测过不等于坏了。
+// Whether a key can be used right now: not while cooling down, and not if it is invalid, quota-exhausted, or suspended.
+// "Unknown" still counts as usable — not having been probed does not mean it is bad.
 function keyIsUsable(key) {
   if (!key) return false;
   if (cooldownLeft(key)) return false;
   return !keyHealthFrozen(key);
 }
-// 每把 key 最近一次拿到的用量，挑号时用来优先选剩余额度多的那把。
+// The most recent usage seen for each key, used during selection to prefer the one with more quota left.
 const _keyUsage = new Map(); // key -> { used, total, at }
-// 每把 key 最近一次被真实请求用过的时间，用于同档位内轮转。
+// When each key was last used by a real request, for rotation within the same tier.
 const _keyLastUsedAt = new Map();
 function noteKeyUsage(key, info) {
   if (!key || !info) return;
@@ -2318,23 +2445,23 @@ function noteKeyUsage(key, info) {
 function noteKeyUsed(key) {
   if (key) _keyLastUsedAt.set(key, Date.now());
 }
-// 剩余额度比例（0~1）。没有用量数据时返回 null，排序里当"未知"处理。
+// Remaining-quota ratio (0 to 1). Return null when there is no usage data, and treat it as "unknown" in the sort.
 function keyHeadroom(key) {
   const u = _keyUsage.get(key);
   if (!u) return null;
   return Math.max(0, Math.min(1, (u.total - u.used) / u.total));
 }
-// 可用密钥按"现在最该用哪把"排序。
+// Sort usable keys by "which one should be used right now".
 //
-// 早先所有挑号入口都是 getApiKeys().find(keyIsUsable) —— 永远取列表里第一把可用
-// 的。号多的时候这会把负载全压在前几把上：第一把被打满限流 → 切到第二把 → 第二把
-// 也满 → 逐个打死，而列表后面那些额度富裕的号一次都没被用到。冷却一结束又立刻
-// 回到第一把，循环往复。
+// Every selection entry used to be getApiKeys().find(keyIsUsable) — always the first usable key in the list.
+// With many accounts that piles the whole load onto the first few: the first one fills up and throttles → switch to the second → the second
+// fills up too → they die one by one, while accounts later in the list with plenty of quota are never used. The moment a cooldown ends it goes
+// straight back to the first one, and the cycle repeats.
 //
-// 排序规则：
-//   1. 状态确认正常的排在"未检测"前面（未检测不等于坏，但正常是确定的）
-//   2. 剩余额度多的优先，把负载摊到额度富裕的号上（差距小于 2% 视为同档）
-//   3. 都一样就选最久没用过的，天然形成轮转
+// Sort rules:
+//   1. A state confirmed healthy ranks ahead of "not checked" (not checked does not mean bad, but healthy is certain)
+//   2. More remaining quota comes first, spreading load onto accounts that have plenty (a gap under 2% counts as the same tier)
+//   3. If those are equal, pick the one unused the longest, which rotates on its own
 function rankUsableKeys(exclude) {
   const skip = exclude instanceof Set ? exclude : new Set(exclude || []);
   return getApiKeys()
@@ -2355,15 +2482,15 @@ function rankUsableKeys(exclude) {
     })
     .map((e) => e.key);
 }
-// 均衡路由用的额度档位：剩余额度按 25% 一档粗分桶，只有跨档才算「更富裕」。
+// Quota tiers for balanced routing: remaining quota is bucketed coarsely at 25% steps, and only crossing a bucket counts as "richer".
 //
-// 为什么不像 rankUsableKeys 那样直接比精确值：_keyUsage 只在账户信息同步时更新，
-// 请求打出去消耗掉的额度不会立刻反映回来。按精确值比大小的话，剩 90% 和剩 88% 也
-// 算「更富裕」，于是每个请求都挑同一把，要等下一次同步才发现它降下来了 —— 均衡就
-// 退化成「一直用额度最多的那把」。分桶把这点噪音抹平，同档内交给「最久没用过」轮转。
-// 那个 2% 的判定对 failover 够用（低频、撞墙才走一次），对每请求挑号不够。
+// Why not compare exact values the way rankUsableKeys does: _keyUsage is updated only when account info syncs,
+// and quota spent by a request that already went out is not reflected immediately. Comparing exact values would treat 90% left and 88% left as
+// "richer" too, so every request picks the same key until the next sync notices it has dropped — balancing
+// collapses into "always use the key with the most quota". Buckets smooth that noise out, and within a bucket rotation goes to "unused the longest".
+// That 2% test is enough for failover (low frequency, and it runs only after hitting a wall), but not for picking a key on every request.
 //
-// 数据太旧的一律当未知（返回 null）：陈旧额度不该主导挑号，宁可退回纯轮转。
+// Anything too old counts as unknown (return null): stale quota should not drive selection. Falling back to pure rotation is better.
 const USAGE_FRESH_MS = 10 * 60 * 1000;
 const HEADROOM_BUCKET = 0.25;
 function keyHeadroomBucket(key) {
@@ -2372,14 +2499,14 @@ function keyHeadroomBucket(key) {
   const h = Math.max(0, Math.min(1, (u.total - u.used) / u.total));
   return Math.floor(h / HEADROOM_BUCKET);
 }
-// 均衡路由的号池和顺位。跟 rankUsableKeys 有两处刻意的不同：
+// The pool and ordering for balanced routing. Two deliberate differences from rankUsableKeys:
 //
-//   * 只收状态确认正常的号。rankUsableKeys 把「未检测」也算可用，那是给 failover
-//     用的 —— 撞墙之后有一把没试过的总比没有好。但常态下的负载分摊不该拉未检测的
-//     号进来：它可能本来就是坏的，只是还没被发现，轮到它就白费一次往返。
-//     冷却中和已判死的号在 keyIsUsable 那层就已经挡掉了。
-//   * 额度按档位比，同档内按「最久没用过」轮转（noteKeyUsed 每次转发都记时间），
-//     于是连续请求会在正常号之间自然摊开。
+//   * Only accounts whose state is confirmed healthy. rankUsableKeys also counts "not checked" as usable, which is for failover —
+//     after hitting a wall, an untried key is better than none. Ordinary load spreading should not pull in an unchecked
+//     account: it may already be bad and just not discovered yet, and its turn would waste a round trip.
+//     Accounts that are cooling down or already marked dead are blocked earlier, inside keyIsUsable.
+//   * Quota is compared by tier, and within a tier we rotate by "unused the longest" (noteKeyUsed records the time on every forward),
+//     so consecutive requests spread naturally across healthy accounts.
 function rankHealthyKeys(exclude) {
   const skip = exclude instanceof Set ? exclude : new Set(exclude || []);
   return getApiKeys()
@@ -2390,34 +2517,34 @@ function rankHealthyKeys(exclude) {
       last: Number(_keyLastUsedAt.get(k) || 0),
     }))
     .sort((a, b) => {
-      // 额度档位高的先用；有一方没有新鲜数据就跳过这轮比较，直接看轮转。
+      // Use the higher quota tier first. If either side has no fresh data, skip this comparison and look at rotation directly.
       if (a.bucket != null && b.bucket != null && a.bucket !== b.bucket) return b.bucket - a.bucket;
       return a.last - b.last;
     })
     .map((e) => e.key);
 }
-// 对外呈现四种账号状态：正常 / 限流中 / 额度用尽 / 已禁用。
+// Four account states are shown outward: healthy / throttled / quota exhausted / suspended.
 //
-// 剩下那些细分（403 被拒、上游故障、未检测）都是过程态 —— 插件自己换号、自己等
-// 冷却就消化掉了，用户不需要跟着操心，一律折叠成"正常"。
-// 鉴权失效并进"已禁用"：对用户来说这两种的含义完全一样 —— 这把号不能用了，
-// 去换一把或删掉，没必要用两个词表达同一个动作。
+// The remaining distinctions (403 refused, upstream fault, not checked) are transient — the extension switches accounts and waits out
+// the cooldown on its own, and the user does not need to follow along. They all collapse to "healthy".
+// Authentication failure is folded into "suspended": to the user the two mean exactly the same thing — this account cannot be used,
+// so switch to another or delete it. There is no need for two words for the same action.
 //
-// 限流单独露出来，是因为它跟另外三种的处置办法都不一样：号没毛病，只是这会儿发得
-// 太快，等几分钟自己就好。折进"正常"会让用户看着一切正常却发现请求在换号；折进
-// "额度用尽"又会让人以为得去充钱或者换号。
+// Throttling is shown on its own because the remedy differs from the other three: nothing is wrong with the account, it is just sending
+// too fast right now, and it recovers on its own in a few minutes. Folding it into "healthy" would show everything fine while requests keep switching accounts; folding it into
+// "quota exhausted" would make people think they have to pay or switch accounts.
 const PUBLIC_STATE = { quota: "quota", suspended: "suspended", invalid: "suspended" };
 function publicState(state) {
   return PUBLIC_STATE[String(state || "")] || "ok";
 }
-// 曾被限流的记录，只为了在面板上显示「限流中」。
+// A record of having been throttled, only so the panel can show "throttled".
 //
-// 关键在于它不参与挑号。本项目其余三条路径（转发的端点回退、流内错误、推理探活）
-// 都刻意不把 429 记成账号状态 —— 限流通常是端点/区域级的并发配额，不是这把号坏了，
-// 把它从挑号里排除只会让一把健康的号白闲着。尤其账号巡检是并发打管理端点的，本身
-// 就容易撞 429，一排除就可能一次性废掉大半号池，反而没号可用。
-// 所以这里只记不排除：keyIsUsable 完全不看它。
-// TTL 跟官方那套探测的 passiveStatus 一致 —— 10 分钟内没有新的限流迹象就自动消失。
+// The point is that it does not take part in selection. The other three paths in this project (forwarding's endpoint fallback, in-stream errors, inference liveness)
+// also deliberately refuse to record a 429 as account state — throttling is usually a concurrency quota at the endpoint or region level, not this account being bad,
+// and excluding it from selection only leaves a healthy account sitting idle. The account sweep in particular hits management endpoints concurrently and
+// is itself likely to hit a 429. Excluding on that could retire most of the pool at once, and then there is no account left to use.
+// So this only records and does not exclude: keyIsUsable does not look at it at all.
+// The TTL matches passiveStatus in the official probe — if no new throttle signal appears within 10 minutes, it disappears on its own.
 const THROTTLE_SEEN_TTL_MS = 10 * 60 * 1000;
 const _keyThrottledAt = new Map();
 function noteKeyThrottled(key) {
@@ -2434,40 +2561,40 @@ function keyThrottled(key) {
   if (Date.now() - at > THROTTLE_SEEN_TTL_MS) { _keyThrottledAt.delete(key); return false; }
   return true;
 }
-// 面板用：每把 key 的展示状态。
-// 只给状态词，不给冷却剩余时间也不给复检时刻 —— 那些是内部节奏，面板不展示。
+// For the panel: the display state of each key.
+// Only the state word. No remaining cooldown and no recheck time — those are internal cadence, and the panel does not show them.
 function keyStatusSnapshot() {
   const out = {};
   for (const key of getApiKeys()) {
-    // 先走一次冻结检查，顺带把到期的终态解掉，面板拉一次状态就能看到复检结果。
-    // 这里必须静默：本函数就是 pushStats 的数据源，解冻再回推会变成嵌套调用。
+    // Run the freeze check once first, which also clears a terminal state that has expired, so one panel pull can see the recheck result.
+    // This must be silent: this function is pushStats' data source, and pushing again on unfreeze would nest the calls.
     keyHealthFrozen(key, { silent: true });
     const h = _keyHealth.get(key);
     const pub = publicState(h && h.state);
-    // 终态优先于限流：一把号既额度用尽又在限流冷却里时，该报的是前者 —— 等限流
-    // 过去它照样不能用。
+    // A terminal state outranks throttling: when an account is both quota-exhausted and inside a throttle cooldown, what should be reported is the former — once the throttle
+    // passes it still cannot be used.
     out[key] = { state: pub !== "ok" ? pub : (keyThrottled(key) ? "throttled" : "ok") };
   }
   return out;
 }
 function coolDownKey(key, kind) {
   if (!key) return;
-  // 账号状态先记，跟冷却时长没关系。
-  // 额度用尽、鉴权失效、被禁用都是"这把号本身有问题"，属于终态；限流只是暂时的，
-  // 冷却过去还能用，不给它扣坏账号的帽子。
-  // 这一步必须在冷却之前做：冷却分钟数可以设成 0，早先的写法在 ms<=0 时直接
-  // 返回，于是把状态判定一起跳过了 —— 号明明已经用不了，面板还一直显示正常，
-  // 切号也不会跳过它。
+  // Record account state first. It has nothing to do with how long the cooldown is.
+  // Quota exhausted, authentication failed, and suspended all mean something is wrong with this account itself, and they are terminal. Throttling is only temporary;
+  // once the cooldown passes it can be used again, so do not hang a bad-account label on it.
+  // This step has to happen before the cooldown: the cooldown minutes can be set to 0, and the old code returned immediately when ms<=0,
+  // which skipped the state judgment along with it — the account was already unusable, the panel kept showing healthy,
+  // and switching would not skip it either.
   if (KIND_TO_STATE[kind]) setKeyHealth(key, KIND_TO_STATE[kind], { reason: KIND_LABEL[kind] });
-  // 转发时撞出来的结论，是上游对着一发真实请求给的答复 —— 额度用尽 / 溢出上限 /
-  // 账号被禁用这三类直接把号清出列表，不用等探活（它默认还关着）。
-  // 这一行原先被合并错插进了 cooldownLeft，而那里没有 kind 变量，于是每次读冷却
-  // 都抛 ReferenceError，把面板的状态推送整条打断。
+  // A conclusion hit during forwarding is the answer upstream gave to one real request — quota exhausted, overage cap,
+  // and account suspended remove the account from the list directly, with no wait for the liveness probe (which is off by default).
+  // This line was once merged into the wrong place, inside cooldownLeft, where there is no kind variable, so every cooldown read
+  // threw ReferenceError and broke the whole panel state push.
   scheduleDeadDrop(key, kind);
   const { cooldownMs } = getSwitchPrefs();
-  // 软失败（上游 5xx）跟账号本身无关，压一个固定的 20 秒短冷却就够：让同一轮里
-  // 的其他号先顶上，很快自己恢复。用用户配置的冷却时长（默认 5 分钟）会在上游
-  // 抖一下的时候把所有号一次性排除干净，反而没号可用。
+  // A soft failure (upstream 5xx) has nothing to do with the account itself. A fixed 20-second short cooldown is enough: let the other accounts in the same round
+  // take over, and it recovers soon. Using the user-configured cooldown (5 minutes by default) would, on one upstream
+  // hiccup, exclude every account at once, and then there is no account left to use.
   const ms = SOFT_KINDS.has(kind) ? SOFT_COOLDOWN_MS : cooldownMs * (COOLDOWN_FACTOR[kind] || 1);
   if (ms <= 0) {
     log("[KRS] 密钥 " + maskKey(key) + " " + (KIND_LABEL[kind] || kind) + "（冷却已关闭）");
@@ -2476,11 +2603,11 @@ function coolDownKey(key, kind) {
   _keyCooldown.set(key, { until: Date.now() + ms, kind });
   log("[KRS] 密钥 " + maskKey(key) + " " + (KIND_LABEL[kind] || kind)
     + "，冷却 " + Math.round(ms / 1000) + "s");
-  // 限流现在是面板上看得见的状态了，写完就推一次，别让用户等下一轮 5 秒轮询才
-  // 看到「限流中」。冷却结束后的恢复仍然靠轮询，那个延迟无所谓。
+  // Throttling is now a state the panel can see, so push once as soon as it is written, instead of making the user wait for the next 5-second poll to
+  // see "throttled". Recovery after the cooldown still relies on polling, and that delay does not matter.
   if (panelProvider) panelProvider.pushStats();
 }
-// 冷却剩余毫秒（0 = 可用）。顺手清掉已过期的条目。
+// Remaining cooldown in milliseconds (0 = usable). Expired entries are cleared along the way.
 function cooldownLeft(key) {
   const entry = _keyCooldown.get(key);
   if (!entry) return 0;
@@ -2488,18 +2615,18 @@ function cooldownLeft(key) {
   if (left <= 0) { _keyCooldown.delete(key); return 0; }
   return left;
 }
-// 成功用过就说明这把 key 是好的，立刻解除冷却并标回正常。
-// 真跑通一次是最硬的证据，所以给 force：万一之前误判成了终态，这里能自己翻案。
+// Having been used successfully means this key is good. Clear the cooldown immediately and mark it healthy again.
+// A request that actually got through is the hardest evidence, so pass force: if it was previously misjudged as terminal, this can reverse it.
 function clearCooldown(key) {
   if (_keyCooldown.has(key)) {
     _keyCooldown.delete(key);
     if (panelProvider) panelProvider.pushStats();
   }
-  // 跑通了就说明限流已经过去，不用等那 10 分钟 TTL 自己到期。
+  // Getting through means the throttle has already passed, with no need to wait out the 10-minute TTL.
   clearKeyThrottled(key);
   setKeyHealth(key, "ok", { force: true });
 }
-// 面板用：当前处于冷却中的密钥。
+// For the panel: keys currently cooling down.
 function cooldownSnapshot() {
   const out = [];
   for (const key of [..._keyCooldown.keys()]) {
@@ -2508,13 +2635,13 @@ function cooldownSnapshot() {
   }
   return out;
 }
-// 本次请求要用哪把 key 起步。
+// Which key this request should start with.
 //
-// 均衡路由关着（或没有一把确认正常的号）时是老行为：优先用户选中的那把，它状态不
-// 正常（冷却中、已失效、额度用尽）才顺位换一把。
-// 开着时不再粘着选中的那把，每个请求都重新问一遍「现在最该用哪把」——
-// rankHealthyKeys 里同档位按「最久没用过」排前面，而每次转发都会 noteKeyUsed，
-// 于是连续请求在正常号之间自然轮转，负载摊开而不是全压在第一把上。
+// When balanced routing is off (or no account is confirmed healthy), the old behavior applies: prefer the one the user selected, and only if its state is not
+// healthy (cooling down, invalid, quota exhausted) move on to the next one.
+// When it is on, do not stick to the selected one. Every request asks again "which one should be used right now" —
+// Within a tier, rankHealthyKeys puts "unused the longest" first, and every forward calls noteKeyUsed,
+// so consecutive requests rotate naturally across healthy accounts instead of piling everything onto the first one.
 function pickStartKey() {
   const active = getActiveApiKey();
   const prefs = getSwitchPrefs();
@@ -2522,28 +2649,28 @@ function pickStartKey() {
   if (prefs.loadBalance) {
     const picked = rankHealthyKeys()[0];
     if (picked) return picked;
-    // 一把「确认正常」的都没有（常见于刚加完号、还没同步过账户信息，全是未检测）。
-    // 这时候不能干等，落回下面的老逻辑，先把请求发出去再说。
+    // There is not a single account "confirmed healthy" (common right after adding accounts, before account info has synced, when everything is unchecked).
+    // We cannot sit and wait then. Fall through to the old logic below and get the request out first.
   }
   if (!active || keyIsUsable(active)) return active;
   return rankUsableKeys([active])[0] || active;
 }
-// 下一把没试过、且状态正常的 key。已失效和额度用尽的直接跳过，不浪费一次往返。
-// 顺位由 rankUsableKeys 决定（正常优先、额度多优先、最久没用优先）。
+// The next key not yet tried, and whose state is healthy. Skip invalid and quota-exhausted ones, and do not waste a round trip.
+// Order comes from rankUsableKeys (healthy first, more quota first, unused the longest first).
 function nextUsableKey(tried) {
   return rankUsableKeys(tried)[0] || null;
 }
-// 把切换结果落盘，这样后续请求、状态栏和面板都跟着走。
+// Persist the switch, so later requests, the status bar, and the panel all follow.
 async function adoptKey(key) {
   try {
     await set("activeApiKey", key);
-    // 自动模式下顺手把地区切成这把密钥自己的区域。这里只读缓存、不发探测请求：
-    // 转发是热路径，不能为了识别地区多等一次往返。缓存没有就维持现状，稍后的
-    // 账户同步或面板操作会把它补上。
+    // In automatic mode, also switch the region to this key's own region. This only reads the cache and sends no probe:
+    // forwarding is a hot path and cannot wait an extra round trip just to identify the region. If the cache has nothing, leave things as they are; a later
+    // account sync or a panel action will fill it in.
     if (isRegionAuto()) {
       const r = trustedCachedRegion(key) || jsonHomeRegion(key);
       if (r && r !== configuredRegion()) await applyDetectedRegion(r, { silent: true });
-      // 这把号还没探过区：后台补探一次，别等第一次请求撞了跨区 403 再纠正。
+      // This account has not had its region probed yet: probe once in the background, instead of waiting for the first request to hit a cross-region 403 and then correcting it.
       else if (!trustedCachedRegion(key) && !jsonHomeRegion(key)) ensureRegionForKeySoon(key);
     }
     updateStatusBar();
@@ -2552,13 +2679,13 @@ async function adoptKey(key) {
     log("!! 切换密钥失败: " + (e?.message || e));
   }
 }
-// 均衡路由实际用上的那把号要让用户看见：面板的选中态和状态栏都跟着走，否则界面
-// 显示的还是上一把，跟真正在跑的对不上。
+// The account balanced routing actually used should be visible to the user: the panel's selection and the status bar both follow, otherwise the UI
+// still shows the previous one and does not match the one that is really running.
 //
-// 但转发是热路径 —— 一轮对话里 Kiro 会连发好几个请求（意图分类、生成…），每个都
-// 写一遍 VSCode 配置太重。所以这里节流：
-//   * key 没变就什么都不做（命中最多的一条）
-//   * 变了也不立刻写，攒一个短窗口再落盘；窗口里又换了就只落最后那一把
+// But forwarding is a hot path — within one turn Kiro fires several requests in a row (intent classification, generation, …), and writing
+// VS Code config on every one of them is too heavy. So this is throttled:
+//   * if the key did not change, do nothing (the most common case)
+//   * if it did change, do not write immediately; hold a short window and then persist. If it changes again inside the window, persist only the last one
 const ACTIVE_SYNC_DEBOUNCE_MS = 1200;
 let _activeSyncTimer = null;
 let _activeSyncWant = "";
@@ -2573,7 +2700,7 @@ function syncActiveKeySoon(key) {
     _activeSyncTimer = null;
     const want = _activeSyncWant;
     _activeSyncWant = "";
-    // 攒的这一小段时间里，这把号可能已经被删掉、或者刚被判死了，落盘前再确认一遍。
+    // During that short hold, this account may already have been deleted, or just marked dead, so confirm once more before persisting.
     if (!want || want === getActiveApiKey()) return;
     if (!getApiKeys().includes(want) || !keyIsUsable(want)) return;
     adoptKey(want);
@@ -2581,17 +2708,17 @@ function syncActiveKeySoon(key) {
 }
 
 // ---------------------------------------------------------------------------
-// 刚删掉的坏号记忆
+// Memory of bad accounts just deleted
 // ---------------------------------------------------------------------------
-// 真正的删除动作在探活那一节（runLivenessScan → deleteKeyAutomatic）：判废的依据是
-// 真发一次请求拿到的响应，比用量接口推算硬得多。这里只补一件探活没管的事 ——
+// The real deletion happens in the liveness section (runLivenessScan → deleteKeyAutomatic): the basis for retiring an account is
+// the response from a request we actually sent, which is much harder evidence than inferring from the usage API. This only covers one thing liveness does not —
 //
-// 刚被删掉的坏号记一段时间。号池（尤其是拼车那种共享池）很可能马上又把同一把号发
-// 下来，而它刚刚才被判成额度用尽 / 已禁用 —— 再收一次只会重走「导入 → 撞墙 → 判死
-// → 删除」，白烧往返。这段时间内当重复号跳过；过了这个期限还给同一把，那就再收，
-// 因为那时候额度可能真的到新周期了。
+// Remember a bad account that was just deleted, for a while. The pool (especially a shared carpool-style pool) is likely to hand the same account back down
+// right away, and it was just judged quota-exhausted or suspended — accepting it again only repeats "import → hit the wall → mark dead
+// → delete" and wastes round trips. Skip it as a duplicate during this window. If the same account comes back after the window,
+// accept it again, because the quota may genuinely be on a new cycle by then.
 const DEAD_KEY_MEMORY_MS = 6 * 60 * 60 * 1000;
-const _deadKeyAt = new Map(); // key -> 被自动删掉的时间
+const _deadKeyAt = new Map(); // key -> when it was deleted automatically
 function rememberDeadKey(key) {
   if (key) _deadKeyAt.set(key, Date.now());
 }
@@ -2601,28 +2728,28 @@ function isRecentlyDeadKey(key) {
   if (Date.now() - at > DEAD_KEY_MEMORY_MS) { _deadKeyAt.delete(key); return false; }
   return true;
 }
-// 探活之外的删除入口。
+// Deletion entries other than the liveness probe.
 //
-// 真探活（runLivenessScan）默认是关着的 —— 它每探一把号就烧一个生成请求。要是只让它
-// 触发删除，绝大多数人的坏号永远清不掉。而下面这两条路径零额外成本：转发那一发本来
-// 就要发，免费巡检走的是控制面用量 GET。
+// A real liveness probe (runLivenessScan) is off by default — each probe of an account burns one generate request. If only that path
+// can trigger deletion, most people's bad accounts would never be cleared. The two paths below cost nothing extra: the forwarding request was going to be
+// sent anyway, and the free sweep is a control-plane usage GET.
 //
-// 只认「上游亲口拒绝服务」的这三类。用量接口拿 used >= total 推出来的额度用尽不算：
-// POWER 这类号 base 用超之后还有 overage 余量，照样能跑，用量却已经显示 10508/10000,
-// 按那个删就是把一把还能用的号弄丢，而且不可逆。
+// Only these three kinds of "upstream itself refused to serve" are accepted. Quota exhausted inferred from used >= total on the usage API does not count:
+// a POWER-style account still has overage left after base is exceeded and can still run, yet usage already shows 10508/10000,
+// and deleting on that number loses an account that can still be used, and it is irreversible.
 const HARD_DEAD_KINDS = new Set(["suspended", "overage", "quota"]);
 const HARD_DROP_DELAY_MS = 800;
-const _dropQueue = new Map(); // key -> 删除原因
+const _dropQueue = new Map(); // key -> reason for deletion
 let _dropTimer = null;
 function scheduleDeadDrop(key, kind) {
   if (!key || !HARD_DEAD_KINDS.has(kind) || !getAutoDeleteOnDead()) return;
   _dropQueue.set(key, KIND_LABEL[kind] || kind);
   if (_dropTimer) return;
-  // 判定发生在同步路径上（coolDownKey / noteAccountHealth 都会顺手回推面板），在那里
-  // 直接 await 删除会套娃，所以攒一个短窗口再做。
+  // The judgment happens on the sync path (coolDownKey / noteAccountHealth both push the panel as they go). Awaiting a delete there
+  // would nest, so hold a short window and then do it.
   _dropTimer = setTimeout(async () => {
     _dropTimer = null;
-    // 一把一把删：每次都要重新读列表（上一次删除已经改过配置），批量算下标会串位。
+    // Delete one at a time: the list has to be reread each time (the previous delete already changed the config), and computing indexes in a batch would shift them.
     while (_dropQueue.size) {
       const [k, why] = _dropQueue.entries().next().value;
       _dropQueue.delete(k);
@@ -2636,7 +2763,7 @@ function scheduleDeadDrop(key, kind) {
 }
 
 // ---------------------------------------------------------------------------
-// Prompt injection (前置 / 后置提示词)
+// Prompt injection (prefix / suffix prompts)
 // ---------------------------------------------------------------------------
 // The fixed prompts are added to the CURRENT user message only, never to the
 // conversation history kiro-agent replays on every turn, and never to the
@@ -2687,7 +2814,7 @@ function applyPromptPrefs(bodyBuf) {
   msg.content = next;
   return { buf: Buffer.from(JSON.stringify(j), "utf8"), applied: tags.join("+") };
 }
-// Replace the current user message with the rule's 自动回复词 before a re-send,
+// Replace the current user message with the rule's auto-reply text before a re-send,
 // keeping the conversation history intact so the upstream still sees the full
 // context — only the last thing "the user said" changes.
 function applyRetryReply(bodyBuf, replyText) {
@@ -2706,26 +2833,26 @@ function applyRetryReply(bodyBuf, replyText) {
 }
 
 // ---------------------------------------------------------------------------
-// Auto retry (自动重试)
+// Auto retry (automatic retry)
 // ---------------------------------------------------------------------------
 // Off by default: this gateway's contract is to surface the selected key's real
 // error instead of silently papering over it. When enabled, an upstream failure
 // whose status or body matches a rule is re-sent (same key) up to `max` times
 // before the error reaches Kiro.
-// Kiro 展示任何上游错误时都会套上这句前缀，例如聊天窗里看到的
-// 「Something went wrong: [InternalServerException] Encountered an unexpected
-// error…」。这句是 Kiro 自己加的，上游原文里并没有 —— 而用户能看到的只有它，
-// 照着它写规则是最自然的做法。所以匹配时把这句也算进去，否则照 UI 文案写的
-// 规则永远命中不了。
+// Whenever Kiro shows an upstream error it wraps this prefix around it, for example what you see in the chat window:
+// "Something went wrong: [InternalServerException] Encountered an unexpected
+// error…". Kiro itself adds this sentence; it is not in the upstream original — and it is the only thing the user can see,
+// so writing a rule from it is the most natural thing to do. Count this sentence when matching, or a rule written from the UI copy
+// will never hit.
 const KIRO_ERROR_PREFIX = "Something went wrong";
-// 异常类型短名。event stream 里的 __type 常带包名前缀
-// （com.amazon.coral.service#InternalServerException），写规则的人一般只记得
-// 后面那截，所以单独再拼一份短名进去。
+// Short name of the exception type. __type in an event stream often carries a package prefix
+// (com.amazon.coral.service#InternalServerException). Whoever writes the rule usually only remembers
+// the tail, so a separate short name is appended as well.
 function exceptionName(text) {
   const m = String(text || "").match(/([A-Za-z][A-Za-z0-9_]*(?:Exception|Error|Fault))\b/);
   return m ? m[1] : "";
 }
-// 规则要匹配的那段文本：状态码 + Kiro 的固定前缀 + 上游原文 + 异常类型短名。
+// The text a rule matches against: status code + Kiro's fixed prefix + the upstream original + the exception short name.
 function retryHaystack(status, bodyText) {
   const body = String(bodyText || "");
   const parts = ["HTTP " + status, KIRO_ERROR_PREFIX, body];
@@ -2733,13 +2860,13 @@ function retryHaystack(status, bodyText) {
   if (type) parts.push(type);
   return parts.join(" ").toLowerCase();
 }
-// opts.replyOnly: 只看带自动回复词的规则。
+// opts.replyOnly: look only at rules that carry auto-reply text.
 //
-// 带回复词的规则表达的意图是「用这句话把对话续下去」，跟自动切号（换一把 key
-// 重发同样的内容）是互斥的两件事，所以转发路径里让它优先于切号。典型场景就是
-// 「命中 Access denied → 回复 继续」：Access denied 同时是切号判定密钥失效的
-// 关键词，不给回复词插队的机会，这条规则永远拿不到执行。
-// reply 为空的规则仍然让切号先走 —— 原样重发和换号重发没有区别，换号更有意义。
+// A rule with reply text means "continue the conversation with this sentence", which is mutually exclusive with an automatic key switch (resend the same content
+// on another key), so the forwarding path lets it take priority over switching. The typical case is
+// "on Access denied → reply continue": Access denied is also the keyword the switch decision uses for an invalid key.
+// Without a chance for the reply text to cut in line, this rule never gets to run.
+// A rule with an empty reply still lets the switch go first — resending as-is and resending on another account are no different, and switching accounts means more.
 function matchedRetryRule(status, bodyText, opts = {}) {
   const p = getRetryPrefs();
   if (!p.enabled) return null;
@@ -2773,11 +2900,11 @@ function isDeterministicClientError(status) {
   return status >= 400 && status < 500
     && status !== 408 && status !== 425 && status !== 429;
 }
-// 把一段已经缓存下来的响应体交回给 Kiro。
+// Hand a response body that has already been buffered back to Kiro.
 //
-// content-length 不是 hop-by-hop 头，会被原样转发，所以必须按真正写出的字节数
-// 改写：错误体超过 ERR_BODY_CAP 时只转发了前一截，读响应流出错时更是一个字节
-// 都没有 —— 头里却写着完整长度，Kiro 就会一直等那些永远不会来的字节，直到超时。
+// content-length is not a hop-by-hop header and would be forwarded as-is, so it must be rewritten to the number of bytes actually written:
+// when the error body exceeds ERR_BODY_CAP only the first slice is forwarded, and when reading the response stream fails not a single byte
+// went out — yet the header still says the full length, and Kiro waits for bytes that will never come, until it times out.
 function sendBufferedBody(res, status, upHeaders, buf) {
   const body = Buffer.isBuffer(buf) ? buf : Buffer.alloc(0);
   const headers = stripHopByHop(upHeaders);
@@ -2858,9 +2985,9 @@ function injectAuthHeaders(incoming, targetHost, keyOrAuth) {
   headers["authorization"] = "Bearer " + auth.token;
   if (auth.type === "apikey") headers["tokentype"] = "API_KEY";
   else if (auth.tokenType) headers["tokentype"] = auth.tokenType;
-  // 插件关闭时，Kiro 的 bearer 和 x-amzn-kiro-profile 属于同一个号。
-  // 这里只换 token 的话，头还是 IDE 当前登录号，对话会被判 access_denied。
-  // JSON 号改成它自己的 profileArn；没有就去掉，避免留下别人的身份。ksk_ 不带这些头。
+  // When the extension is off, Kiro's bearer and x-amzn-kiro-profile belong to the same account.
+  // If only the token is swapped here, the header is still the account the IDE is logged into, and the conversation is judged access_denied.
+  // A JSON account is changed to its own profileArn; if it has none, remove the header, so someone else's identity is not left behind. ksk_ does not carry these headers.
   if (alignProfileHeaders(headers, auth)) log("[auth] profile 头已改成当前账号");
   const has = (name) => Object.keys(headers).some((h) => h.toLowerCase() === name);
   if (!has("x-amzn-kiro-agent-mode")) headers["x-amzn-kiro-agent-mode"] = "vibe";
@@ -2970,12 +3097,12 @@ function forwardOfficialKrsRequest(req, res, bodyBuf) {
 // ---------------------------------------------------------------------------
 // Reverse proxy: swap credential, strip profileArn, forward to Kiro gateway.
 // ---------------------------------------------------------------------------
-// opts.sniff(bodyText, status, req): 旁路嗅探响应体。
+// opts.sniff(bodyText, status, req): sniff the response body off to the side.
 //
-// 插件自己要用上游的一些数据（模型计费倍率、账号用量），但又必须保证转发给 Kiro
-// 的字节跟官方原样一致。所以嗅探是"旁路"的：一边把 chunk 原样写给 Kiro，一边攒
-// 一份副本给自己看，攒够上限就不再攒，绝不因为嗅探改动或延迟转发的内容。
-// 只对确定很小的 JSON 响应开启，其余一律走 pipe。
+// The extension needs some upstream data for itself (model billing multipliers, account usage), but the bytes forwarded to Kiro
+// must stay identical to the official original. So sniffing is a side path: write each chunk to Kiro unchanged, and also keep
+// a copy for ourselves. Stop keeping the copy once the cap is reached, and never let sniffing change or delay what is forwarded.
+// Turn it on only for JSON responses that are known to be small. Everything else goes through pipe.
 const SNIFF_CAP = 64 * 1024;
 function makeProxyHandler(label, baseFn, opts = {}) {
   return function handle(req, res) {
@@ -3020,9 +3147,9 @@ function makeProxyHandler(label, baseFn, opts = {}) {
 
       log("-> [" + label + "] " + keyTag + " " + req.method + " " + req.url.split("?")[0] + " region=" + getRegion());
 
-      // 传输层故障的退避重发状态。只有请求发不出去 / 连接中途断了才重发；一旦上游
-      // 给了响应头（res.headersSent）就绝不重发 —— 那时字节已经在往 Kiro 流了，
-      // 重发会造成两份响应交叉。
+      // Backoff-resend state for a transport failure. Resend only when the request cannot be sent or the connection drops halfway. Once upstream
+      // has given response headers (res.headersSent), never resend — bytes are already streaming to Kiro by then,
+      // and a resend would interleave two responses.
       let transportRetries = 0;
       let transportBackoffMs = 0;
       const send = () => {
@@ -3047,7 +3174,7 @@ function makeProxyHandler(label, baseFn, opts = {}) {
             upRes.on("error", () => { try { res.end(); } catch {} });
             return;
           }
-          // 旁路嗅探：转发照旧一个 chunk 一个 chunk 原样写出，副本只是顺手攒的。
+          // Side-path sniff: forwarding still writes one chunk at a time, unchanged. The copy is only accumulated along the way.
           const seen = [];
           let seenLen = 0;
           upRes.on("data", (c) => {
@@ -3056,9 +3183,9 @@ function makeProxyHandler(label, baseFn, opts = {}) {
               seen.push(buf);
               seenLen += buf.length;
             }
-            // 背压得自己接上。pipe 本来替我们做这件事，改成手动转发就漏掉了：下游
-            // 写不动时 write 返回 false，此时不停上游的话数据会全积在内存里。
-            // 当前只嗅探用量/模型这类小 JSON，看不出差别，但别给以后埋坑。
+            // Backpressure has to be wired up ourselves. pipe used to do this for us, and switching to manual forwarding dropped it: when downstream
+            // cannot write, write returns false, and if upstream is not paused then, the data all piles up in memory.
+            // Right now we only sniff small JSON such as usage and models, so the difference is invisible, but do not leave a trap for later.
             let flushed = true;
             try { flushed = res.write(buf); } catch { return; }
             if (!flushed) {
@@ -3068,7 +3195,7 @@ function makeProxyHandler(label, baseFn, opts = {}) {
           });
           upRes.on("end", () => {
             try { res.end(); } catch {}
-            // 嗅探失败绝不能影响这次转发 —— 字节早就发出去了，这里只是自己看一眼。
+            // A sniff failure must never affect this forward — the bytes went out long ago, and this is only us taking a look.
             try { opts.sniff(Buffer.concat(seen).toString("utf8"), status, req); } catch {}
           });
           upRes.on("error", () => { try { res.end(); } catch {} });
@@ -3113,25 +3240,25 @@ function makeProxyHandler(label, baseFn, opts = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// 不中断重试
+// Retry without interrupting
 // ---------------------------------------------------------------------------
-// 原则：一轮对话不能因为换号、状态检测、冷却这些内部动作而失败。上游怎么拒都行，
-// 网关自己想办法把它变成一次成功的回答 —— 换号、等冷却、再换回来，全在同一个
-// HTTP 请求里做完，Kiro 只看到最终结果。
+// Principle: one turn of conversation must not fail because of an internal action such as switching accounts, checking state, or cooling down. However upstream refuses,
+// the gateway finds a way to turn it into a successful answer — switch accounts, wait out a cooldown, switch back, all inside the same
+// HTTP request. Kiro only sees the final result.
 //
-// 兜住这件事的只有两条边界：
-//   1. Kiro 自己取消了（用户点停止、窗口重载）—— 没人等答案了，立刻收手
-//   2. 时间预算用完 —— 再耗下去客户端自己也会超时，这时才把最后一次失败如实交回
+// Only two boundaries hold this in:
+//   1. Kiro itself cancelled (the user hit stop, or the window reloaded) — nobody is waiting for an answer, so stop immediately
+//   2. The time budget is used up — going on any longer and the client will time out on its own, and only then is the last failure handed back as it is
 const NO_INTERRUPT_BUDGET_MS = 15 * 60 * 1000;
-// 所有号都在冷却时的轮询间隔：等最快到期的那把，但至少隔这么久再试一次，
-// 免得空转。
+// Poll interval when every account is cooling down: wait for the one that expires soonest, but wait at least this long before trying again,
+// so we do not spin empty.
 const NO_INTERRUPT_WAIT_MS = 2500;
 
-// KRS（生成平面）处理器。默认从用户选中的那把 key 出发；上游一旦表示这把 key
-// 现在用不了（限流 / 403 / 额度用尽 / 鉴权失效 / 上游 5xx），就在同一个请求内换
-// 下一把可用的 key 重发 —— 这就是"无感切号"，Kiro 只会看到最终结果，也不需要
-// 重新加载窗口。号都在冷却时不认输，等到期再来一轮，直到预算耗尽。
-// 自动切号可以在设置里关掉，关掉后就是严格的"只用选中的那把"。
+// The KRS (generate plane) handler. It starts from the key the user selected by default. The moment upstream says this key
+// is unusable right now (throttling / 403 / quota exhausted / auth failure / upstream 5xx), switch to the
+// next available key and resend inside the same request — that is the "seamless switch". Kiro only sees the final result, and there is no need to
+// reload the window. When every account is cooling down, do not give up; come around again when one expires, until the budget runs out.
+// Automatic switching can be turned off in settings. Off, it is strictly "use only the selected one".
 function makeKrsHandler() {
   return function handle(req, res) {
     if (req.url === HEALTH_PATH) {
@@ -3140,10 +3267,10 @@ function makeKrsHandler() {
       return;
     }
     markProxyHit("KRS", req);
-    // 起步用哪把 key 交给 pickStartKey 决定（当前选中的那把优先，它不可用就顺位
-    // 挑一把正常的），这里只确认"至少配了一把"。
-    // 早先这里写的是"只用选中的那把、没有 failover"，那是自动切号之前的行为，
-    // 留着只会误导 —— 真正的切号逻辑在下面的 trySwitchKey。
+    // Which key to start with is decided by pickStartKey (the currently selected one first, and if it is unusable, move on and
+    // pick a healthy one). Here we only confirm that at least one is configured.
+    // What used to be written here was "use only the selected one, with no failover". That was the behavior before automatic switching,
+    // and leaving it would only mislead — the real switch logic is in trySwitchKey below.
     if (!getApiKeys().length) {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ message: "Kiro Gateway: no API key configured." }));
@@ -3163,23 +3290,23 @@ function makeKrsHandler() {
         return;
       }
       let bodyBuf = incomingBody;
-      // profileArn 按当前凭证类型在 attempt 里处理：ksk_ 必须摘掉，JSON/OAuth 必须带上。
-      // 这里先不动，否则混用号池时切到 JSON 号会丢掉它自己的 profileArn。
+      // profileArn is handled inside attempt according to the current credential type: a ksk_ must have it stripped, and a JSON/OAuth credential must carry it.
+      // Leave it alone here, or switching to a JSON account in a mixed pool would drop that account's own profileArn.
 
       const statOp = operationName(req);
       const isChat = BILLED_OP_RE.test(statOp);
-      // 只有两个平面都认的操作才参与端点轮换，其余一律只走 KRS。
+      // Only operations both planes recognize take part in endpoint rotation. Everything else goes only through KRS.
       const isRotatable = ROTATABLE_OP_RE.test(statOp);
       const epChain = isRotatable
         ? filterUnsupportedEndpoints(genEndpointChain(), getRegion(), statOp)
         : krsOnlyChain();
-      // 不可轮换的操作不参与端点回退，行为严格等同只走 KRS 的老路径。
-      // 必须用 isRotatable 而不是 isChat：epChain 上面已经按 isRotatable 定型，这里
-      // 再用 isChat 会出现"链只有 krs 一个、却允许回退"的错配（SendMessage 正是
-      // 这种情况）。
+      // A non-rotatable operation does not take part in endpoint fallback. Behavior is strictly the old path that only goes through KRS.
+      // isRotatable must be used, not isChat: epChain above was already fixed by isRotatable, and using
+      // isChat here would mismatch "the chain has only krs, yet fallback is allowed" (SendMessage is exactly
+      // that case).
       const epFallbackAllowed = isRotatable && getEndpointFallback();
-      // 路径、查询串、请求体、除凭证外的全部请求头都原样透传 —— 跟只走 KRS 的老
-      // 路径唯一的差别就是这里的主机名，不按端点分叉。
+      // Path, query string, body, and every request header except credentials are passed through unchanged — the only difference from the old
+      // KRS-only path is the hostname here. Do not fork by endpoint.
       const buildTarget = (epIdx, urlPath) => {
         try {
           return new URL(epChain[epIdx].base(getRegion()) + (urlPath || req.url));
@@ -3192,7 +3319,7 @@ function makeKrsHandler() {
         res.end(JSON.stringify({ message: "bad target url for endpoint " + epChain[0].id }));
         return;
       }
-      // Fixed 前置/后置提示词 go only on real chat turns.
+      // Fixed prefix/suffix prompts go only on real chat turns.
       if (isChat) {
         const injected = applyPromptPrefs(bodyBuf);
         if (injected.applied) {
@@ -3203,29 +3330,29 @@ function makeKrsHandler() {
       const statModel = modelIdFromBody(bodyBuf);
       const retryCfg = getRetryPrefs();
       const maxAttempts = retryCfg.enabled ? retryCfg.max + 1 : 1;
-      // 自动切号：从用户选中的那把开始（它在冷却中就先跳过）。
+      // Automatic key switch: start from the one the user selected (skip it first if it is cooling down).
       //
-      // 这里不再限制"每把只试一次、切完就认输"。目标是不中断 Kiro 这轮对话：只要
-      // 客户端还在等、时间预算还没用完，就一直换号 / 等冷却 / 重发，把失败全部在
-      // 网关内部消化掉。轮完一圈没成功就清空"已试过"再来一圈，靠 deadline 收口，
-      // 不会无限打下去。
+      // This no longer limits itself to "try each one only once, then give up". The goal is not to interrupt this turn of Kiro's conversation: as long as
+      // the client is still waiting and the time budget is not used up, keep switching accounts, waiting out cooldowns, and resending, and digest every failure
+      // inside the gateway. When one full circle fails, clear "already tried" and come around again. The deadline closes it off,
+      // so it will not hammer forever.
       const switchCfg = getSwitchPrefs();
       const triedKeys = new Set();
       const deadline = Date.now() + NO_INTERRUPT_BUDGET_MS;
       const startKey = pickStartKey() || getApiKey();
-      // 本次请求已经试过的端点。429 只在还有没试过的端点时才切，切一轮就够 ——
-      // 两个端点都限流说明是真的发太快了，这时候继续换只是把请求灌进同样的窗口。
+      // Endpoints already tried for this request. A 429 switches only while an untried endpoint remains, and one pass is enough —
+      // both endpoints throttling means we really are sending too fast, and switching further only pours requests into the same window.
       const triedEndpoints = new Set();
       const startEpIdx = pickStartEndpointIndex(epChain);
-      // 端点链走到第几轮。本轮所有端点都撞上限流时退避一次再重走，轮数用尽才放弃。
+      // Which round the endpoint chain is on. When every endpoint this round hits the limit, back off once and walk it again. Give up only when the rounds run out.
       let epRound = 1;
-      // 耐心模式下的指数退避状态。跨 attempt() 累加，只有换 key 时重置：换成另一把
-      // 号意味着"限流跟这把 key 无关"这个前提失效了，新号有独立的并发余量，退避
-      // 应该从头算。
+      // Exponential-backoff state for patience mode. It accumulates across attempt() and resets only when the key changes: switching to another
+      // account means the premise "throttling has nothing to do with this key" no longer holds. The new account has its own concurrency headroom, and the backoff
+      // should start over.
       let endlessBackoffMs = 0;
       let endlessWaitedMs = 0;
-      // 上游临时故障（5xx）的重试计数与退避。跟限流的退避分开算：两者的成因和收敛
-      // 条件都不同，混在一起会互相干扰次数统计。
+      // Retry count and backoff for a temporary upstream fault (5xx). Kept separate from the throttle backoff: the two have different causes and different
+      // conditions for settling, and mixing them interferes with the attempt counts.
       let serverRetries = 0;
       let serverBackoffMs = 0;
       // If Kiro cancels the request (user hits stop, window reload…) there is
@@ -3237,8 +3364,8 @@ function makeKrsHandler() {
       // memory while we decide whether the rule matched.
       const ERR_BODY_CAP = 64 * 1024;
 
-      // 每次尝试都自带 body 和 key：自动回复词会改写当前用户消息，自动切号会换
-      // 掉凭证，两者都让下一次发出的内容与上一次不同。
+      // Every attempt carries its own body and key: auto-reply text rewrites the current user message, and an automatic switch replaces
+      // the credentials. Both make what goes out next different from last time.
       const attempt = (n, body, key, epIdx = startEpIdx) => {
         const begin = (auth) => attemptReady(n, body, key, epIdx, auth);
         const cached = peekFreshAuth(key);
@@ -3269,17 +3396,17 @@ function makeKrsHandler() {
         if (sendBody.length) headers["content-length"] = Buffer.byteLength(sendBody);
         triedKeys.add(key);
         triedEndpoints.add(ep.id);
-        // 记一次"这把号刚被用过"：同档位的号靠它轮转，不会永远压在列表第一把上。
+        // Record "this account was just used": accounts in the same tier rotate on it, and it will not sit on the first one in the list forever.
         noteKeyUsed(key);
-        // 均衡路由挑到了别的号时，把面板选中态和状态栏也带过去（内部节流，
-        // 没换号就是一次空调用）。
+        // When balanced routing picks a different account, take the panel selection and the status bar along (throttled internally;
+        // if the account did not change this is a no-op call).
         syncActiveKeySoon(key);
-        // 诊断信息一次打全：操作名、入站 content-type、实际转发的主机 + 路径。
-        // 路径永远是 "/"（操作在 x-amz-target 里），不打出来就看不出这条请求是生成、
-        // 会话还是行内补全；content-type 决定上游用哪套协议解析。缺一个都得靠猜。
+        // Dump the diagnostics in one go: operation name, inbound content-type, and the host plus path actually forwarded.
+        // The path is always "/" (the operation is in x-amz-target). Without logging it you cannot tell whether this request is generation,
+        // a conversation, or inline completion. content-type decides which protocol upstream uses to parse it. Missing either one means guessing.
         const inCt = String((req.headers && (req.headers["content-type"] || req.headers["Content-Type"])) || "-");
-        // body 大小也打出来：连接复用之后，剩下的耗时大头是请求体上传（会话历史 +
-        // 文件正文每轮全量重传）。没有这个数就没法判断该继续抠代码还是该收敛上下文。
+        // Log the body size too: once connections are reused, the remaining bulk of the time is uploading the request body (conversation history plus
+        // file contents are retransmitted in full every turn). Without this number there is no way to tell whether to keep tuning the code or to shrink the context.
         log("-> [KRS] " + keyTag + " " + req.method + " " + req.url.split("?")[0]
           + " op=" + statOp + (isRotatable ? "" : " (不可轮换，只走 KRS)")
           + " ct=" + inCt
@@ -3294,9 +3421,9 @@ function makeKrsHandler() {
         // exactly one of those (or a transport error) closes the attempt.
         statsRequestStarted(statIn, key);
         let statEnded = false;
-        // counted=false：这次失败被自动切号或自动重试内部消化掉了，Kiro 那边
-        // 根本没看到失败，所以不该记进「错误数」。只有最终真的把失败交回给
-        // Kiro（没号可换的 429、上游 5xx、网络错误等）才算一次错误。
+        // counted=false: this failure was digested internally by an automatic key switch or an automatic retry. Kiro
+        // never saw a failure, so it should not be recorded in the error count. Only a failure that is finally handed back to
+        // Kiro (a 429 with no account left to switch to, an upstream 5xx, a network error, and so on) counts as one error.
         const endOnce = (ok, counted = true) => {
           if (statEnded) return;
           statEnded = true;
@@ -3304,7 +3431,7 @@ function makeKrsHandler() {
           statsRequestFinished();
         };
         // Re-send after the configured pause, keeping the client waiting. A rule
-        // with a 自动回复词 re-sends that text as the user's message instead of
+        // with an auto-reply phrase re-sends that text as the user's message instead of
         // repeating the original one.
         const scheduleRetry = (rule, opts = {}) => {
           if (clientGone) return;
@@ -3319,26 +3446,26 @@ function makeKrsHandler() {
             + (opts.beforeSwitch ? "，带回复词的规则优先于自动切号" : ""));
           setTimeout(() => { if (!clientGone) attempt(n + 1, nextBody, key, epIdx); }, retryCfg.delayMs);
         };
-        // 带自动回复词的规则先于切号试一次。重试次数用尽后仍然会落到
-        // trySwitchKey，所以「这把 key 真的失效了」的兜底没有丢：不是不换号，
-        // 只是先把回复词试完。
-        // 只对聊天请求成立 —— 工具回合改写不了用户消息（applyRetryReply 拿不到
-        // currentMessage），那时回复词无从应用，让它插队只会白等一轮再换号。
+        // A rule that carries auto-reply text is tried once before switching accounts. After the retries run out it still falls through to
+        // trySwitchKey, so the fallback for "this key really is invalid" is not lost: it is not that we refuse to switch accounts,
+        // only that the reply text is tried first.
+        // This holds only for chat requests — a tool turn cannot rewrite the user message (applyRetryReply cannot get
+        // currentMessage), so the reply text has nowhere to apply, and letting it cut in line only waits one round for nothing before switching accounts.
         const replyRuleFirst = (status, text) => {
           if (!isChat || n >= maxAttempts) return null;
           return matchedRetryRule(status, text, { replyOnly: true });
         };
-        // 冷却最快到期还差多久（没有号在冷却时返回 0）。只服务下面的等待时长计算。
+        // How long until the soonest cooldown expires (0 when no account is cooling down). This only serves the wait calculation below.
         const soonestCooldownMs = () => {
           const list = cooldownSnapshot();
           if (!list.length) return 0;
           return Math.max(0, Math.min(...list.map((c) => c.leftMs)));
         };
-        // 不中断兜底：任何一次失败在真正交回 Kiro 之前都先问它一句「还能不能接着救」。
-        //   Kiro 自己取消了 / 预算用完了 → false，把失败如实交回去
-        //   还有没试过的可用号         → 立刻换号重发
-        //   号都试过或都在冷却         → 清空"已试过"，等最快到期的那把，再来一轮
-        // 返回 true 表示这轮失败已经被接走，调用方不许再往 res 写任何东西。
+        // The no-interrupt fallback: before any failure is truly handed back to Kiro, ask it once "can this still be saved".
+        //   Kiro cancelled on its own, or the budget is used up → false, and hand the failure back as it is
+        //   An available account has not been tried yet         → switch accounts and resend immediately
+        //   Every account was tried, or all are cooling down    → clear "already tried", wait for the one that expires soonest, and come around again
+        // Returning true means this failure has already been taken over. The caller must not write anything else to res.
         const keepTrying = (why) => {
           if (clientGone) return false;
           if (!switchCfg.enabled) return false;
@@ -3351,11 +3478,11 @@ function makeKrsHandler() {
           let next = nextUsableKey(triedKeys);
           let waitMs = 0;
           if (!next) {
-            // 一圈轮完了。不认输：忘掉"这轮试过谁"，等最快解冻的那把号再来一圈。
+            // One circle is done. Do not give up: forget who was tried this round, and come around again with the account that unfreezes soonest.
             triedKeys.clear();
             next = nextUsableKey(triedKeys);
             if (!next) {
-              // 连一把没冷却的号都没有：按最近的解冻时间等，至少等 NO_INTERRUPT_WAIT_MS。
+              // There is not even one account that is not cooling down: wait by the nearest unfreeze time, and at least NO_INTERRUPT_WAIT_MS.
               waitMs = Math.min(Math.max(soonestCooldownMs(), NO_INTERRUPT_WAIT_MS), leftMs);
               next = pickStartKey() || key;
             }
@@ -3364,8 +3491,8 @@ function makeKrsHandler() {
             + "用 " + maskKey(next) + " 重发（剩余预算 " + Math.round(leftMs / 1000) + "s）");
           const go = () => {
             if (clientGone) return;
-            // 换号后端点链重新开一轮：新号的并发余量是独立的，原号身上累计的端点
-            // 冷却与退避对它不成立。
+            // After a switch, the endpoint chain starts a fresh round: the new account's concurrency headroom is its own, and the endpoint
+            // cooldowns and backoff accumulated on the old account do not apply to it.
             triedEndpoints.clear();
             epRound = 1;
             endlessBackoffMs = 0;
@@ -3375,15 +3502,15 @@ function makeKrsHandler() {
           if (waitMs > 0) setTimeout(go, waitMs); else go();
           return true;
         };
-        // 端点能力缺失。跟限流是两件事，所以单独一条通路。
+        // Missing endpoint capability. This is separate from throttling, so it has its own path.
         //
-        // 场景：KRS 限流 → 改道 q.{region} → 那个平面不认这个操作 → 400
-        // UnknownOperationException。这个 400 完全是我们改道造成的，绝不能交回
-        // Kiro —— 用户看到的就是聊天窗里的红字报错，而它跟账号、跟限流都无关。
+        // The scene: KRS is throttled → divert to q.{region} → that plane does not recognize this operation → 400
+        // UnknownOperationException. This 400 is entirely caused by our diversion and must never be handed back to
+        // Kiro — what the user sees is a red error in the chat window, and it has nothing to do with the account or with throttling.
         //
-        // 处理：把「端点 + 区域 + 操作」记进能力缺失表（后续请求直接跳过，不再浪费
-        // 往返），然后换到链里还支持这个操作的端点重发。要退避一下再发，因为我们
-        // 本来就是因为原端点限流才改道过来的，立刻打回去大概率再吃一次 429。
+        // What to do: record "endpoint + region + operation" in the capability-gap table (later requests skip it directly, and no longer waste a
+        // round trip), then switch to an endpoint in the chain that still supports this operation and resend. Back off before sending, because we
+        // diverted here in the first place because the original endpoint was throttled, and hitting it again immediately will most likely eat another 429.
         const trySwitchEndpointUnsupported = (status, bodyText) => {
           if (clientGone || !epFallbackAllowed) return false;
           if (!isUnsupportedOperationFailure(status, bodyText)) return false;
@@ -3400,21 +3527,21 @@ function makeKrsHandler() {
             return false;
           }
           const delayMs = getEndpointRoundPrefs().delayMs;
-          // 允许再走一次那个端点：它是被限流挡下的，不是不支持。
+          // Allow that endpoint to be tried once more: it was blocked by throttling, not because it is unsupported.
           triedEndpoints.delete(epChain[alt].id);
           log("[KRS] 端点能力缺失: " + delayMs + "ms 后改用 " + epChain[alt].label + " 重发");
           setTimeout(() => { if (!clientGone) attempt(n, body, key, alt); }, delayMs);
           return true;
         };
-        // 上游临时故障重试。
+        // Retry a temporary upstream fault.
         //
-        // 上游回 5xx / InternalServerException 时，错误文案自己就写着 "please try
-        // again"，而实测下一次同样的请求就成功。这属于瞬时错误，内部消化掉就行，
-        // 不该让用户看到红字。
+        // When upstream returns a 5xx / InternalServerException, the error text itself says "please try
+        // again", and the next identical request is measured to succeed. This is a transient error and should be digested internally,
+        // and the user should not see red text.
         //
-        // 跟限流退避共用同一套指数增长和上限配置，但次数有限：限流是"等等就好"、
-        // 等下去必然能通，而 5xx 连续不断更可能是真出问题（典型如账号超额后上游
-        // 行为不稳定，会持续吐 500），无限重试只会让对话一直转着却拿不到结果。
+        // It shares the same exponential growth and cap as the throttle backoff, but the number of tries is limited: throttling is "wait and it will pass",
+        // and waiting long enough is bound to get through, while a 5xx that keeps coming is more likely a real problem (typical when an account is over quota and upstream
+        // behavior is unstable and keeps emitting 500). Retrying without limit only leaves the conversation spinning with no result.
         const tryRetryServerError = (status, bodyText) => {
           if (clientGone) return false;
           if (!isTransientServerFailure(status, bodyText)) return false;
@@ -3434,20 +3561,20 @@ function makeKrsHandler() {
           setTimeout(() => { if (!clientGone) attempt(n, body, key, epIdx); }, serverBackoffMs);
           return true;
         };
-        // 429 优先换端点，不换 key、不计重试次数。
+        // A 429 prefers switching endpoints. Do not switch keys, and do not count it as a retry.
         //
-        // 实测证明 429 USER_REQUEST_RATE_EXCEEDED 是「端点级速率」，不是这把 key 的
-        // 问题：KRS 打爆的同一秒 q. 满速连打全成。把 429 当成 key 的问题去换号 +
-        // 冷却 key，切了也无效（同机器同 machineId），还会把好号标成限流。所以这里
-        // 在 trySwitchKey 之前先拦一道：换端点成功就完全不动 key 状态。
+        // Measurement shows 429 USER_REQUEST_RATE_EXCEEDED is an endpoint-level rate, not a problem with this key:
+        // in the same second KRS is saturated, q. fires at full speed and every one succeeds. Treating the 429 as a key problem and switching accounts plus
+        // cooling the key down does nothing (same machine, same machineId), and it also marks a good account as throttled. So here,
+        // before trySwitchKey, intercept once: if the endpoint switch succeeds, do not touch key state at all.
         const trySwitchEndpoint = (status, bodyText) => {
           if (!isThrottleFailure(status, bodyText)) return false;
           if (clientGone || !epFallbackAllowed) return false;
-          // 刚撞过的端点压一小段冷却，后续请求别再从它起步。
+          // Put the endpoint we just hit into a short cooldown, so later requests do not start from it.
           endpointCoolDown(ep.id);
           const prefs = getEndpointRoundPrefs();
-          // 本次请求进行中探明的能力缺失也要跳过。epChain 在请求开始时就定型了，
-          // 光靠构造期过滤挡不住"跑到一半才发现某端点不支持"的情况。
+          // A capability gap discovered while this request is in flight has to be skipped too. epChain was fixed when the request started,
+          // and filtering at construction time cannot stop "we find halfway through that some endpoint does not support it".
           const skipIds = new Set(
             epChain.filter((e) => isEndpointUnsupported(e.id, getRegion(), statOp)).map((e) => e.id)
           );
@@ -3463,25 +3590,25 @@ function makeKrsHandler() {
             triedEndpoints.clear();
             log("[KRS] 端点回退: 所有端点本轮都限流，" + plan.delayMs + "ms 后开始第 "
               + epRound + "/" + prefs.rounds + " 轮");
-            // 落在可用端点上，不能写死 0 —— 0 号可能正是刚探明不支持的那个。
+            // Land on an available endpoint. Do not hardcode 0 — endpoint 0 may be the one just shown to be unsupported.
             const restartIdx = typeof plan.index === "number" ? plan.index : 0;
             setTimeout(() => { if (!clientGone) attempt(n, body, key, restartIdx); }, plan.delayMs);
             return true;
           }
-          // 轮次用尽：换端点这条路走完了，把决定权交回 handleThrottle 去试换号。
+          // Rounds are used up: the endpoint-switch path is finished, and the decision goes back to handleThrottle to try switching accounts.
           //
-          // 这里绝不能就地退避。早先的写法是在这个分支里直接进入耐心退避并
-          // return true，而耐心模式默认是开的，于是 handleThrottle 里排在后面的
-          // trySwitchKeyForThrottle 永远拿不到执行机会 —— 限流时全程死磕同一把号，
-          // 号池里其它号的并发余量一次也没用上，面板上「自动切换密钥」写的
-          // 「被限流时自动换下一把」也就成了空话。
+          // This must not back off in place. The old code entered the patience backoff directly in this branch and
+          // returned true, and patience mode is on by default, so trySwitchKeyForThrottle, which comes later inside handleThrottle,
+          // never got a chance to run — under throttling it hammered the same account the whole time,
+          // and the concurrency headroom of the other accounts in the pool was never used. "Automatically switch keys" on the panel, which says
+          // "switch to the next one when throttled", became an empty promise.
           log("[KRS] 端点回退: " + prefs.rounds + " 轮内所有端点都被限流，改试换号");
           return false;
         };
-        // 限流的最后一手：端点和号都试过一圈了，退避一段再从头来。
+        // The last move for throttling: endpoints and accounts have both been tried once around, so back off for a while and start over.
         //
-        // 默认开耐心模式（throttleRetryForever）：不把 429 交回 Kiro，用指数退避一直
-        // 重试，只有 Kiro 侧取消（clientGone）才停。关掉它就恢复「都试过即报错」。
+        // Patience mode (throttleRetryForever) is on by default: do not hand a 429 back to Kiro. Keep retrying with exponential backoff,
+        // and stop only when the Kiro side cancels (clientGone). Turning it off restores "report an error once everything has been tried".
         const throttleBackoffWait = () => {
           if (clientGone) return false;
           const patience = getThrottlePatience();
@@ -3492,16 +3619,16 @@ function makeKrsHandler() {
           const prefs = getEndpointRoundPrefs();
           endlessBackoffMs = nextBackoffMs(endlessBackoffMs, prefs.delayMs, patience.capMs);
           endlessWaitedMs += endlessBackoffMs;
-          // 退避的语义是「等限流窗口过去，再完整来一圈」，所以这一圈的「已试过」记录
-          // 要一起清掉。不清的话醒来后端点和号都还挂着「试过」，只能在最后那把号上
-          // 反复死磕，退避就白等了。
+          // The meaning of the backoff is "wait for the throttle window to pass, then do a full circle again", so this circle's "already tried" record
+          // has to be cleared too. If it is not, on waking up both endpoints and accounts are still marked tried, and the only option is to
+          // hammer the last account over and over. The wait was for nothing.
           triedEndpoints.clear();
           triedKeys.clear();
           epRound = 1;
           log("[KRS] 限流退避: " + endlessBackoffMs + "ms 后再来一圈（端点 + 号）"
             + "（已累计等 " + Math.round(endlessWaitedMs / 1000) + "s，稳态上限 "
             + Math.round(patience.capMs / 1000) + "s；关 throttleRetryForever 可恢复旧行为）");
-          // 落在可用端点上：写死 0 的话每一轮都白打一次已知不支持的那个端点。
+          // Land on an available endpoint: hardcoding 0 would waste one hit, every round, on the endpoint already known to be unsupported.
           const idx0 = epChain.findIndex(
             (e) => !isEndpointUnsupported(e.id, getRegion(), statOp));
           setTimeout(() => {
@@ -3509,74 +3636,74 @@ function makeKrsHandler() {
           }, endlessBackoffMs);
           return true;
         };
-        // 限流时的换号。端点全试过之后走这里 —— 不同账号有各自独立的并发余量，
-        // 换一把号往往立刻就通，比干等一轮退避划算得多。
+        // Switching accounts under throttling. This runs after every endpoint has been tried — different accounts have their own concurrency headroom,
+        // and switching accounts often gets through immediately, which is much better value than waiting out a whole backoff round.
         //
-        // 但绝不给当前 key 记账号状态：429 说明不了这把 key 的好坏，标成「限流中」
-        // 只会让面板误导人，还让自动挑号跳过一把其实健康的号。
+        // But never record account state on the current key: a 429 says nothing about whether this key is good. Marking it "throttled"
+        // only misleads the panel, and makes automatic selection skip an account that is actually healthy.
         //
-        // 返回 false 的两种情况（自动切号关着 / 号都试过一圈了）都由调用方接手去做
-        // 耐心退避，不会把 429 直接甩回 Kiro。
+        // The two cases that return false (automatic switching is off, or every account has been tried once around) are taken over by the caller for the
+        // patience backoff, and the 429 is not thrown straight back at Kiro.
         const trySwitchKeyForThrottle = () => {
           if (clientGone || !switchCfg.enabled) return false;
           const next = nextUsableKey(triedKeys);
           if (!next) return false;
           log("[KRS] 限流换号: " + maskKey(key) + " → " + maskKey(next)
             + "（端点已全部试过；不标记账号状态）");
-          // 换号后端点链重新开一轮：新号的并发余量是独立的。
+          // After a switch, the endpoint chain starts a fresh round: the new account's concurrency headroom is its own.
           triedEndpoints.clear();
           epRound = 1;
-          // 换号即"限流跟原号无关"的假设失效，耐心退避从头算。
+          // Switching accounts means the assumption "throttling has nothing to do with the original account" no longer holds, so the patience backoff starts over.
           endlessBackoffMs = 0;
           endlessWaitedMs = 0;
           adoptKey(next).then(() => { if (!clientGone) attempt(n, body, next, startEpIdx); });
           return true;
         };
-        // 限流的完整处置链：换端点（本轮内换 → 多轮退避）→ 换号 → 耐心退避再来一圈。
-        // 全程不动 key 状态，只打一个「正在被限流」的显示标记。
-        // 三步的先后是有讲究的：端点最便宜（同一把号，两个端点限流桶独立），换号次之
-        // （另一个账号有独立的并发余量），干等最贵，所以放最后。
-        // 返回 true 表示这轮失败已经被接走，调用方不许再往 res 写任何东西。
+        // The full throttle chain: switch endpoints (switch within this round → backoff across rounds) → switch accounts → patience backoff and another circle.
+        // Key state is never touched the whole way. Only a display mark of "currently being throttled" is written.
+        // The order of the three steps is deliberate: an endpoint is cheapest (same account, and the two endpoints have independent throttle buckets), switching accounts is next
+        // (another account has its own concurrency headroom), and waiting it out is the most expensive, so it goes last.
+        // Returning true means this failure has already been taken over. The caller must not write anything else to res.
         const handleThrottle = (status, bodyText) => {
           if (!isThrottleFailure(status, bodyText)) return false;
-          // 标记必须打在这里 —— 这是限流的唯一入口。
+          // The mark has to be written here — this is the only entry point for throttling.
           //
-          // 先前打在 trySwitchKey 的 throttle 分支里，可是 handleThrottle 一旦接手
-          // （换端点或换号成功）调用方就直接 return 了，压根走不到那儿，于是真实限流
-          // 全程无标记，面板一直显示「正常」。
-          // 只标记、不动状态：不压冷却、不写 _keyHealth，keyIsUsable 完全不看它，
-          // 所以挑号照旧能用这把号，单 key 场景也不会被判成不可用。
+          // It used to be written in the throttle branch of trySwitchKey, but once handleThrottle takes over
+          // (an endpoint switch or an account switch succeeds) the caller returns immediately and never gets there, so a real throttle
+          // went unmarked the whole way and the panel kept showing "healthy".
+          // Only mark it, and do not touch state: no cooldown, nothing written to _keyHealth, and keyIsUsable does not look at it at all,
+          // so selection can still use this account, and a single-key setup is not judged unusable either.
           noteKeyThrottled(key);
           if (trySwitchEndpoint(status, bodyText)) return true;
           if (trySwitchKeyForThrottle()) return true;
           return throttleBackoffWait();
         };
-        // 这把 key 用不了就换下一把，同一个请求内立刻重发；成功与否 Kiro 都只看到
-        // 最终结果，所以整个过程对用户是无感的。重试次数不受影响：换 key 不算重试。
+        // If this key is unusable, switch to the next one and resend immediately inside the same request. Success or failure, Kiro only sees
+        // the final result, so the whole process is invisible to the user. The retry count is unaffected: switching keys does not count as a retry.
         const trySwitchKey = (status, bodyText) => {
-          // 先判定并记状态，再看能不能换号。两件事必须分开：换不了号（开关关着、
-          // 客户端已经走了）不代表这把号还是好的 —— 早先的写法在那几种情况下直接
-          // 返回，连账号状态都不记，于是一把已经被封的号在面板上仍显示正常，后续
-          // 每次请求还会继续挑中它。
+          // Judge and record the state first, then see whether we can switch accounts. The two have to stay separate: being unable to switch (the switch is off,
+          // or the client is already gone) does not mean this account is still good — the old code returned immediately in those cases,
+          // without even recording account state, so an account that had already been banned still showed healthy on the panel, and later
+          // requests kept picking it.
           const kind = keyFailureKind(status, bodyText);
           if (!kind) return false;
-          // 限流不记账号状态：429 是端点级速率问题，跟这把 key 的好坏无关。给它记
-          // 「限流中」+ 冷却只会让面板误导人，单 key 场景下更是每隔一两分钟就把唯一
-          // 一把好号标成不可用。限流该走的是 handleThrottle（换端点 → 多轮退避 →
-          // 换号 → 耐心退避）；那条路都走不通时（比如耐心模式被关掉），这里仍然按
-          // 不中断语义继续救，只是不动状态。
+          // Throttling does not record account state: a 429 is an endpoint-level rate problem and says nothing about whether this key is good. Recording
+          // "throttled" plus a cooldown only misleads the panel, and in a single-key setup it marks the only
+          // good account unusable every minute or two. Throttling belongs on handleThrottle (switch endpoints → backoff across rounds →
+          // switch accounts → patience backoff). When that path cannot be walked (for example patience mode is turned off), this still keeps saving it under the
+          // no-interrupt rule, it just does not touch state.
           if (kind === "throttle") {
-            // 记一笔，但只用于面板显示「限流中」：不压冷却、不改账号状态，
-            // keyIsUsable 完全不看它。用户需要看出"此刻正在被限流"，而挑号照旧可以
-            // 用这把号 —— 单 key 场景下唯一那把更不能因为限流就被判成不可用。
+            // Record a note, but only so the panel can show "throttled": no cooldown, no change to account state,
+            // and keyIsUsable does not look at it at all. The user needs to see that it is being throttled right now, while selection can still
+            // use this account — in a single-key setup the only one must not be judged unusable just because of throttling.
             noteKeyThrottled(key);
             return keepTrying(maskKey(key) + " 限流（不标记账号状态）");
           }
           coolDownKey(key, kind);
-          // 地区填错的表现和密钥失效一模一样，这里顺手在后台复核一次地区。
+          // A wrong region looks exactly like an invalid key, so recheck the region once in the background while we are here.
           recheckRegionOnAuthFailure(key, kind);
-          // 当前选中的号已经判死，先让可用的那把接手，下一次请求不必再撞同一面墙。
-          // 自动切号关着时 maybeAdoptUsableKey 内部会自己跳过。
+          // The currently selected account has already been marked dead. Let an available one take over first, so the next request does not hit the same wall.
+          // When automatic switching is off, maybeAdoptUsableKey skips this on its own.
           maybeAdoptUsableKey();
           return keepTrying(maskKey(key) + " " + (KIND_LABEL[kind] || kind));
         };
@@ -3588,10 +3715,10 @@ function makeKrsHandler() {
             const ok = status >= 200 && status < 300;
             log((ok ? "<- [KRS] " : "!! [KRS] ") + keyTag + " -> HTTP " + status + (ok ? " (serving)" : ""));
 
-            // 失败：先把（很小的）错误体缓存下来，在任何字节到达 Kiro 之前判断，
-            // 这样重发才能做到透明。
-            // 这里不再判断"还有没有牌可打" —— 不中断模式下永远还有牌（换号、等冷却
-            // 再来一轮），只有 keepTrying 说不行了才真的把这份错误体发出去。
+            // On failure: buffer the (small) error body first, and decide before any byte reaches Kiro,
+            // so a resend can stay transparent.
+            // This no longer asks "is there still a card to play" — in no-interrupt mode there is always another card (switch accounts, wait out a cooldown
+            // and come around again). Only when keepTrying says no is this error body actually sent.
             if (!ok) {
               const parts = [];
               let size = 0;
@@ -3600,31 +3727,31 @@ function makeKrsHandler() {
                 if (size < ERR_BODY_CAP) { parts.push(d); size += d.length; }
               });
               upRes.on("end", () => {
-                // 证据要带上抽帧后的正文：分帧的禁用文案只看原始字节匹配不到，
-                // 账号状态就永远不会被标记。
+                // The evidence has to include the body after frames are extracted: framed suspension copy cannot be matched from the raw bytes,
+                // and the account state would never get marked.
                 const bodyText = failureEvidence(Buffer.concat(parts).toString("utf8"));
-                // 端点能力缺失最先判：这个 400 是我们改道造成的，跟账号无关，
-                // 交回 Kiro 就是聊天窗里的红字。
+                // Judge a missing endpoint capability first: this 400 was caused by our diversion and has nothing to do with the account.
+                // Handing it back to Kiro is a red error in the chat window.
                 if (trySwitchEndpointUnsupported(status, bodyText)) { endOnce(false, false); return; }
-                // 限流：换端点 → 多轮退避 → 换号 → 退避再来一圈，全程不动 key 状态。
+                // Throttling: switch endpoints → backoff across rounds → switch accounts → back off and come around again, without touching key state the whole way.
                 if (handleThrottle(status, bodyText)) { endOnce(false, false); return; }
-                // 上游临时故障：原端点退避重发，不换 key、不换端点。
+                // A temporary upstream fault: back off and resend on the original endpoint. Do not switch keys and do not switch endpoints.
                 if (tryRetryServerError(status, bodyText)) { endOnce(false, false); return; }
-                // 带自动回复词的规则再试：它要的是用那句话续接对话，不是换号。
+                // Try a rule that carries auto-reply text again: what it wants is to continue the conversation with that sentence, not to switch accounts.
                 const replyRule = replyRuleFirst(status, bodyText);
                 if (replyRule) { endOnce(false, false); scheduleRetry(replyRule, { beforeSwitch: true }); return; }
-                // 其次换 key：这把已经明确不可用，用别的 key 重试才有意义。
-                // 换号成功就是一次无感切换，不记错误数。
+                // Next, switch keys: this one is clearly unusable, and retrying with another key is what makes sense.
+                // A successful switch is one seamless switch, and it is not counted in the error count.
                 if (trySwitchKey(status, bodyText)) { endOnce(false, false); return; }
                 if (n < maxAttempts) {
                   const rule = matchedRetryRule(status, bodyText);
-                  // 自动重试同样是内部消化，等真的重试不动了才计错误。
+                  // An automatic retry is digested internally the same way. Count an error only when the retry truly cannot move anymore.
                   if (rule) { endOnce(false, false); scheduleRetry(rule); return; }
                 }
-                // 未命中任何明确规则的 4xx 是确定性的请求错误。换 key、换端点或立即
-                // 原样重发都不会改变请求，尤其不能让 400 在 15 分钟预算内形成热循环。
-                // 408/425/429 仍属于可恢复失败，429 已在上面的限流链处理；其余未知
-                // 失败继续保留不中断兜底。
+                // A 4xx that hits no explicit rule is a deterministic request error. Switching keys, switching endpoints, or immediately
+                // resending as-is will not change the request, and a 400 in particular must not spin in a hot loop for the whole 15-minute budget.
+                // 408/425/429 are still recoverable failures. 429 is already handled by the throttle chain above; every other unknown
+                // failure keeps the no-interrupt fallback.
                 if (isDeterministicClientError(status)) {
                   log("!! [KRS] HTTP " + status + " 是不可重试的客户端错误，立即交回 Kiro");
                 } else if (keepTrying("HTTP " + status)) {
@@ -3646,44 +3773,44 @@ function makeKrsHandler() {
             // stream to finish, so the card moves the moment the answer starts.
             if (ok) statsAddCredits(statOp, statModel, key);
 
-            // 响应头先攥在手里，等开头这批字节到手再决定怎么处理：
-            //   开头是错误帧（200 + InternalServerException 之类）或账号禁用提示
-            //     → 当成失败走换号 / 自动重试。此时还没往 Kiro 写过一个字节，重发
-            //       是透明的，Kiro 只会看到最终结果。
-            //   是正常回答 → 立刻放行。
-            // 状态码看不出问题的失败就是靠这一步接住的：光看 HTTP 200，自动重试和
-            // 自动切号都够不着它。回答中途才出错的没办法，前半段已经交给 Kiro 了。
+            // Hold the response headers, and decide what to do once this first batch of bytes is in hand:
+            //   the start is an error frame (200 + InternalServerException and the like) or an account-suspension notice
+            //     → treat it as a failure and go through account switching / automatic retry. Not one byte has been written to Kiro yet, so the resend
+            //       is transparent, and Kiro only sees the final result.
+            //   it is a normal answer → release it immediately.
+            // A failure whose status code shows nothing wrong is caught by this step: looking only at HTTP 200, automatic retry and
+            // automatic switching both cannot reach it. An error that starts halfway through the answer cannot be helped; the first half was already given to Kiro.
             let head = [];
             let headSize = 0;
             let decided = false;
             let opened = false;
-            let handled = false;      // 已被换号 / 重试接走，这个响应不再转发
-            let failedContent = false; // 内容其实是失败（错误帧 / 禁用提示）
+            let handled = false;      // Already taken over by an account switch or a retry; do not forward this response
+            let failedContent = false; // The content is actually a failure (an error frame or a suspension notice)
             let headTimer = null;
-            // 开头已经出现禁用文案的早期信号：判定窗口临时放宽，等关键词到齐。
+            // An early signal of suspension copy has already appeared at the start: widen the decision window temporarily and wait for the keywords to arrive.
             let suspectMode = false;
             const dropHeadTimer = () => {
               if (headTimer) { clearTimeout(headTimer); headTimer = null; }
             };
-            // 判定用的文本：原始字节对付普通 JSON 错误体，拼回来的正文对付被切成
-            // 小帧、关键词跨帧断开的流式回答。两者接在一起当证据。
+            // Text used for the decision: raw bytes for an ordinary JSON error body, and the reassembled text for a streaming answer cut into
+            // small frames whose keywords break across frames. The two are joined together as the evidence.
             const headText = () => {
               const raw = Buffer.concat(head || []).toString("utf8");
               return raw + "\n" + extractStreamText(raw);
             };
-            // 放行之后仍然要盯着后续内容。
+            // Keep watching what follows even after release.
             //
-            // 禁用提示是逐 token 流下来的，关键词完全可能落在判定窗口之外 —— 这种
-            // 情况下这一轮的内容已经交给 Kiro 了（聊天窗里能看到那段 suspended
-            // 提示），救不回来；但把状态记成「已禁用」能让下一次请求自动换号。
-            // 少了这一步，一把已经被封的号会被无限次重复挑中，表现就是"账号禁用后
-            // 不会自动切换"。
+            // A suspension notice streams down token by token, and the keywords can easily land outside the decision window — in that
+            // case this turn's content has already been given to Kiro (the chat window can show that suspended
+            // notice) and cannot be saved. But recording the state as "suspended" lets the next request switch accounts automatically.
+            // Without this step, an account that has already been banned is picked over and over, which shows up as "after the account is suspended
+            // it does not switch automatically".
             let tailScan = "";
             const scanTail = (chunk) => {
               if (tailScan === null) return;
               tailScan += chunk.toString("utf8");
               if (!looksSuspended(tailScan + "\n" + extractStreamText(tailScan))) {
-                // 攒到上限还没命中就不再攒，避免长回答一直堆内存。
+                // Once the cap is reached without a hit, stop accumulating, so a long answer does not keep piling up in memory.
                 if (tailScan.length > TAIL_SCAN_CAP) tailScan = null;
                 return;
               }
@@ -3694,9 +3821,9 @@ function makeKrsHandler() {
               coolDownKey(key, "suspended");
               maybeAdoptUsableKey();
             };
-            // 把攒下的开头连同响应头一起放出去，之后的字节交给 pipe。
-            // finalize=true 表示上游已经结束了，直接一次写完收尾（此时不能再
-            // pipe：流已经结束，pipe 不会再触发 end，res 会一直挂着）。
+            // Release the buffered start together with the response headers, and hand later bytes to pipe.
+            // finalize=true means upstream has already ended. Write it out in one go and finish (pipe must not be used now:
+            // the stream has ended, pipe will never fire end, and res would hang).
             const openStream = (finalize) => {
               if (opened || handled) return;
               opened = true;
@@ -3708,39 +3835,39 @@ function makeKrsHandler() {
                 try { res.end(buf || undefined); } catch {}
                 return;
               }
-              // 已攒的开头接到尾部扫描的起点上：禁用文案的关键词可能正好跨在
-              // "放行的这一批"和"后面那一批"之间，不接上就又漏判了。
+              // Attach the buffered start to the start of the tail scan: a suspension keyword may sit exactly across
+              // "the batch that was released" and "the batch after it", and without joining them it is missed again.
               if (buf) {
                 tailScan = buf.toString("utf8");
                 try { res.write(buf); } catch {}
               }
               upRes.pipe(res);
             };
-            // 只判一次。返回 true 表示已经被换号 / 重试接走，调用方不要再转发。
+            // Judge only once. Returning true means it has already been taken over by an account switch or a retry; the caller must not forward any more.
             const decide = () => {
               if (decided) return handled;
               decided = true;
               dropHeadTimer();
               const raw = Buffer.concat(head || []).toString("utf8");
-              // 证据用 headText()：原始字节对付普通 JSON 错误体，拼回来的正文对付
-              // 被切成小帧、关键词跨帧断开的流式回答。后面所有判定都用这一份 ——
-              // 只传原始字节的话，分片的禁用文案能进这个分支，却在 keyFailureKind
-              // 里又匹配不上，结果判了状态却切不了号。
+              // Evidence uses headText(): raw bytes for an ordinary JSON error body, and the reassembled text for
+              // a streaming answer cut into small frames whose keywords break across frames. Every later decision uses this one copy —
+              // if only the raw bytes are passed, framed suspension copy can enter this branch and then fail to match inside keyFailureKind,
+              // so the state is recorded but the account cannot be switched.
               const evidence = headText();
               if (looksSuspended(evidence)) {
                 failedContent = true;
                 log("!! [KRS] " + keyTag + " 上游返回账号被禁用的提示（HTTP " + status + "），判为已禁用");
                 if (trySwitchKey(status, evidence)) { handled = true; endOnce(false, false); return true; }
-                // 换不了号（自动切号关着 / 没有别的可用号）：trySwitchKey 已经把
-                // 状态记成已禁用并试过接管，这里不用再记一遍。
+                // When the account cannot be switched (automatic switching is off, or no other account is available): trySwitchKey has already
+                // recorded the state as suspended and tried to take over. Do not record it again here.
                 return false;
               }
               const streamErr = streamErrorText(raw);
               if (streamErr) {
                 failedContent = true;
                 log("!! [KRS] " + keyTag + " HTTP " + status + " 但内容是错误帧: " + streamErr.slice(0, 160));
-                // 错误帧里同样会藏着能力缺失、限流和上游临时故障 —— 状态码是 200，
-                // 只看状态码这三条通路都够不着。
+                // An error frame can also hide a missing capability, throttling, and a temporary upstream fault — the status code is 200,
+                // and looking only at the status code cannot reach any of those three paths.
                 if (trySwitchEndpointUnsupported(status, streamErr)) { handled = true; endOnce(false, false); return true; }
                 if (handleThrottle(status, streamErr)) { handled = true; endOnce(false, false); return true; }
                 if (tryRetryServerError(status, streamErr)) { handled = true; endOnce(false, false); return true; }
@@ -3755,25 +3882,25 @@ function makeKrsHandler() {
                   const rule = matchedRetryRule(status, streamErr);
                   if (rule) { handled = true; endOnce(false, false); scheduleRetry(rule); return true; }
                 }
-                // 错误帧但说不上是哪把号的问题（比如上游内部异常）：不中断模式下
-                // 换个号再试，别把这个错误帧交给 Kiro 显示成"Something went wrong"。
+                // An error frame that cannot be pinned on a particular account (for example an internal upstream exception): in no-interrupt mode
+                // try another account, and do not hand this error frame to Kiro to display as "Something went wrong".
                 if (keepTrying("流内错误帧")) { handled = true; endOnce(false, false); return true; }
                 return false;
               }
               if (ok) {
-                clearCooldown(key); // 拿到了正常回答，这把 key 确实是好的
+                clearCooldown(key); // A normal answer came back, so this key really is good
                 return false;
               }
-              // 失败响应走到这里：先按端点级问题处理（这些都跟 key 的好坏无关），
-              // 再记账号状态，最后交给不中断兜底 —— 能换号 / 能等冷却就绝不把失败
-              // 交回 Kiro。
+              // A failure response reaches here: handle endpoint-level problems first (none of those say anything about whether the key is good),
+              // then record account state, and finally hand it to the no-interrupt fallback — if we can switch accounts or wait out a cooldown, never hand the failure
+              // back to Kiro.
               if (trySwitchEndpointUnsupported(status, evidence)) { handled = true; endOnce(false, false); return true; }
               if (handleThrottle(status, evidence)) { handled = true; endOnce(false, false); return true; }
               if (tryRetryServerError(status, evidence)) { handled = true; endOnce(false, false); return true; }
               const kind = keyFailureKind(status, evidence);
-              // 限流除外：429 是端点级并发问题，跟这把 key 的好坏无关，不压冷却也
-              // 不改账号状态。但要记一笔用于面板显示 —— 让用户看出此刻在被限流，
-              // 跟"号坏了"是两回事（这个标记不参与挑号）。
+              // Throttling is the exception: a 429 is an endpoint-level concurrency problem and says nothing about whether this key is good. Do not apply a cooldown and
+              // do not change account state. But do record a note for the panel — so the user can see they are being throttled right now,
+              // which is a different thing from "the account is bad" (this mark does not take part in selection).
               if (kind === "throttle") noteKeyThrottled(key);
               if (kind && kind !== "throttle") {
                 coolDownKey(key, kind);
@@ -3790,13 +3917,13 @@ function makeKrsHandler() {
             upRes.on("data", (d) => {
               statsAddOutBytes(d.length, key);
               if (handled) return;
-              // 已经放行了：内容照旧由 pipe 转发，这里只继续扫描禁用文案，好让
-              // 下一次请求能换号。
+              // Already released: pipe keeps forwarding the content as before. Here we only keep scanning for suspension copy, so
+              // the next request can switch accounts.
               if (opened) { scanTail(d); return; }
               head.push(d);
               headSize += d.length;
-              // 开头出现禁用文案的早期信号就切到更宽的判定窗口，把关键词等齐。
-              // 已经设好的短定时器必须撤掉重设，否则 300ms 一到照样提前放行。
+              // An early signal of suspension copy at the start switches to a wider decision window, and we wait for the keywords to arrive.
+              // A short timer that was already set must be cancelled and set again, or it still releases early when 300ms is up.
               if (!suspectMode && !decided && maybeSuspendedPrefix(headText())) {
                 suspectMode = true;
                 dropHeadTimer();
@@ -3805,7 +3932,7 @@ function makeKrsHandler() {
               const minBytes = suspectMode ? SUSPECT_MIN_BYTES : HEAD_MIN_BYTES;
               const waitMs = suspectMode ? SUSPECT_WAIT_MS : HEAD_WAIT_MS;
               if (headSize < minBytes && !decided) {
-                // 开头太碎，等下一个 chunk；上游要是迟迟不发，定时器兜底放行。
+                // The start is too fragmented; wait for the next chunk. If upstream is slow to send, the timer releases it as a fallback.
                 if (!headTimer) {
                   headTimer = setTimeout(() => {
                     headTimer = null;
@@ -3816,7 +3943,7 @@ function makeKrsHandler() {
                 }
                 return;
               }
-              // 被接走就把上游这条响应丢掉，别再收它的数据。
+              // Once it has been taken over, drop this upstream response and stop reading its data.
               if (decide()) { try { upRes.destroy(); } catch {} return; }
               openStream(false);
             });
@@ -3827,7 +3954,7 @@ function makeKrsHandler() {
                 if (decide()) { try { upRes.destroy(); } catch {} return; }
                 openStream(true);
               }
-              // 内容其实是失败的话，这轮对话对 Kiro 来说等于没成，计进错误数。
+              // If the content is actually a failure, this turn never succeeded as far as Kiro is concerned, so count it in the error count.
               endOnce(ok && !failedContent);
             });
             upRes.on("close", () => {
@@ -3842,8 +3969,8 @@ function makeKrsHandler() {
             upRes.on("error", () => {
               dropHeadTimer();
               if (handled) return;
-              // 还没放行的话可以完全透明地重来一次；已经放行的救不回来（前半段
-              // 回答早就到 Kiro 那边了），只能把流收掉。
+              // If it has not been released yet, the whole thing can be retried transparently. Once released it cannot be saved (the first half of
+              // the answer already reached Kiro), and the only option is to close the stream.
               if (!opened && keepTrying("上游响应中断")) {
                 handled = true;
                 endOnce(false, false);
@@ -3851,8 +3978,8 @@ function makeKrsHandler() {
               }
               endOnce(false);
               if (!opened) {
-                // 响应头还攥在手里：把攒下的那点内容按实际长度交回去，不能带着
-                // 上游那个对不上的 content-length 发一个空 body。
+                // The response headers are still in hand: hand back the little content that was buffered at its real length. Do not send an empty body carrying
+                // upstream's content-length, which would not match.
                 opened = true;
                 const buf = head && head.length ? Buffer.concat(head) : null;
                 head = null;
@@ -3866,12 +3993,12 @@ function makeKrsHandler() {
         upReq.on("error", (e) => {
           log("!! [KRS] " + keyTag + " upstream error: " + e.message);
           if (!res.headersSent) {
-            // 传输层故障先原地退避重发：请求根本没到达上游（TLS 握手被本机代理掐断、
-            // DNS 临时失败、连接被重置），重发不会重复计费也不会产生两份回答，比换号
-            // 更安全也更可能成功 —— 换号对"网络本身不通"毫无帮助。
+            // A transport failure is retried in place with backoff first: the request never reached upstream (the TLS handshake was cut by the local proxy,
+            // a temporary DNS failure, the connection was reset). A resend is not billed twice and does not produce two answers, and it is safer and more likely to succeed than switching accounts —
+            // switching accounts does nothing for "the network itself is down".
             if (tryRetryServerError(0, e.message)) { endOnce(false, false); return; }
-            // 传输层错误一般跟 key 无关，keyFailureKind 只在文本里真出现限流 /
-            // 失效字样时才会命中。换号或重试接住了就不记错误数。
+            // A transport error is usually unrelated to the key. keyFailureKind hits only when the text really contains throttle or
+            // invalid wording. If a switch or a retry catches it, do not count an error.
             const replyRule = replyRuleFirst(0, e.message);
             if (replyRule) { endOnce(false, false); scheduleRetry(replyRule, { beforeSwitch: true }); return; }
             if (trySwitchKey(0, e.message)) { endOnce(false, false); return; }
@@ -3879,8 +4006,8 @@ function makeKrsHandler() {
               const rule = matchedRetryRule(0, e.message);
               if (rule) { endOnce(false, false); scheduleRetry(rule); return; }
             }
-            // 网络抖动、DNS 失败、连接被重置：还没往 Kiro 写过一个字节，换个号
-            // 重发对它完全透明，不该让这轮对话就这么断掉。
+            // Network jitter, a DNS failure, a connection reset: not one byte has been written to Kiro yet, and resending on another account
+            // is completely transparent to it. This turn of the conversation should not just break off.
             if (keepTrying("传输层错误 " + e.message)) { endOnce(false, false); return; }
           }
           endOnce(false);
@@ -3903,7 +4030,7 @@ function makeKrsHandler() {
 // (the "cannot select model" symptom). We DETECT the operation and answer it
 // with the known-good management GET call, returning the raw JSON verbatim so
 // the format Kiro expects is preserved.
-// 识别这次 CPS 请求是哪个操作。路径寻址和 x-amz-target 寻址两种都要认。
+// Recognize which operation this CPS request is. Both path addressing and x-amz-target addressing have to be recognized.
 function cpsOpOf(req) {
   const clean = (req.url || "/").split("?")[0];
   const amzTarget = String(req.headers["x-amz-target"] || req.headers["x-amzn-target"] || "");
@@ -3914,25 +4041,25 @@ function cpsOpOf(req) {
   return "";
 }
 function makeCpsHandler() {
-  // 控制平面一律原样透传，额外挂一个旁路嗅探，把插件自己要的那点数据（模型计费
-  // 倍率、账号用量）顺手记下来 —— 转发给 Kiro 的字节不受任何影响。
+  // The control plane is passed through unchanged, with an extra side-path sniff that records the little data the extension needs for itself (model billing
+  // multipliers, account usage) — the bytes forwarded to Kiro are not affected in any way.
   //
-  // 早先"用量"和"模型列表"这两个操作是截下来自己重发一遍的，那样做丢了四样东西：
-  //   1. Kiro 的原始查询参数被硬编码顶替（resourceType 永远是 AGENTIC_REQUEST），
-  //      IDE 要哪份数据都只能拿到这一份
-  //   2. 请求体被 req.resume() 直接丢弃
-  //   3. 官方响应头全部丢掉，只补一个 Content-Type
-  //   4. 请求失败时回一个 HTTP 200 + {} 假装成功
-  // 结果就是 IDE 里那个百分比圆圈拿不到它真正请求的数据 —— 要么是别的资源类型的
-  // 数字，要么干脆是空对象。而 Kiro 又要靠这个百分比判断该不该压缩上下文，圆圈
-  // 不准，压缩就不触发，上下文一路堆到爆。
-  // 现在官方下发什么，IDE 就收到什么，原封不动。
+  // The "usage" and "model list" operations used to be intercepted and resent by us, and that dropped four things:
+  //   1. Kiro's original query parameters were replaced by hardcoding (resourceType was always AGENTIC_REQUEST),
+  //      so whatever data the IDE asked for, it only ever got this one copy
+  //   2. The request body was thrown away by req.resume()
+  //   3. The official response headers were all dropped, and only a Content-Type was added back
+  //   4. On request failure, an HTTP 200 + {} was returned pretending success
+  // The result: the percentage circle in the IDE never got the data it actually requested — either numbers for some other resource type,
+  // or simply an empty object. And Kiro uses that percentage to decide whether to compress context. If the circle
+  // is wrong, compression never fires, and context piles up until it blows up.
+  // Now whatever the official side sends, the IDE receives, unchanged.
   const passthrough = makeProxyHandler("CPS", managementBase, {
     sniff: (bodyText, status, req) => {
       if (status < 200 || status >= 300 || !bodyText) return;
       const op = cpsOpOf(req);
       if (op === "models") {
-        // 缓存每个模型的计费倍率，用于按真实费率归集每次请求的积分消耗。
+        // Cache each model's billing multiplier, so each request's credit cost is attributed at the real rate.
         rememberModelRates(bodyText);
         return;
       }
@@ -3951,7 +4078,7 @@ function makeCpsHandler() {
       return;
     }
     markProxyHit("CPS", req);
-    // 所有控制平面操作走同一条路：换凭证 + 原样转发 + 原样回传。
+    // Every control-plane operation takes the same path: swap credentials, forward unchanged, and send the response back unchanged.
     passthrough(req, res);
   };
 }
@@ -3968,14 +4095,14 @@ class ProxyServer {
     this.pending = null;
     this.stopped = false;
     this.retryTimer = null;
-    // 端口到底归谁，面板顶栏靠它区分四种情况：
-    //   listening 自己绑上了，请求由本窗口转发
-    //   standby   端口被另一个 Kiro 窗口的同类网关占着 —— 这是正常的多窗口共享，
-    //             请求由那个窗口代转，它退出后本窗口会自动接管，不是错误
-    //   conflict  端口被无关程序占着，得换端口或者关掉那个程序
-    //   idle      没启动
-    // 早先这两种占用都只在日志里写一行，面板上看不出区别，用户只能看到"端口被占"
-    // 然后无从下手。
+    // Who the port actually belongs to. The panel's top bar uses this to tell four cases apart:
+    //   listening this window bound it, and requests are forwarded by this window
+    //   standby   the port is held by the same kind of gateway in another Kiro window — this is normal sharing across windows,
+    //             requests are forwarded by that window, and this window takes over automatically after it exits. It is not an error
+    //   conflict  the port is held by an unrelated program. Change the port, or quit that program
+    //   idle      not started
+    // Both kinds of occupancy used to be only one line in the log. The panel could not tell them apart, and the user only saw "port in use"
+    // with nowhere to go from there.
     this.state = "idle";
   }
   start() {
@@ -3991,8 +4118,8 @@ class ProxyServer {
       try { srv.close(); } catch {}
       if (e.code === "EADDRINUSE") {
         log("!! [" + this.label + "] port " + this.port + " is in use; checking whether it is another healthy gateway");
-        // 占用者是不是自己的同类？是就说明另一个 Kiro 窗口已经把网关起好了，本窗口
-        // 待命就行，不该当成故障报给用户；不是才是真冲突。
+        // Is the occupant one of our own kind? If so, another Kiro window has already brought the gateway up, and this window
+        // should stand by. It should not be reported to the user as a fault. Only when it is not one of ours is it a real conflict.
         this.isReachable().then((sameKind) => {
           if (this.stopped || this.server) return;
           this.state = sameKind ? "standby" : "conflict";
@@ -4015,7 +4142,7 @@ class ProxyServer {
       }
       this.server = srv;
       this.pending = null;
-      // 抢到端口了（可能是首次，也可能是原持有者退出后本窗口接管）。
+      // The port was taken (maybe the first time, or maybe this window took over after the previous holder exited).
       const wasStandby = this.state === "standby";
       this.state = "listening";
       log("[" + this.label + "] listening on 127.0.0.1:" + this.port
@@ -4064,12 +4191,12 @@ class ProxyServer {
   }
 }
 
-// 把两个平面的端口状态汇总成顶栏那一个词。
-//   off      网关开关是关的，Kiro 走自己的端点
-//   conflict 至少一个端口被无关程序占着 —— 最需要用户动手，优先暴露
-//   standby  端口由另一个 Kiro 窗口的网关持有，本窗口待命（多窗口共享的正常态）
-//   running  两个平面都归本窗口
-//   starting 还在绑定
+// Fold the port state of both planes into the one word on the top bar.
+//   off      the gateway switch is off, and Kiro uses its own endpoints
+//   conflict at least one port is held by an unrelated program — this needs the user to act, so expose it first
+//   standby  the port is held by another Kiro window's gateway, and this window stands by (the normal state of sharing across windows)
+//   running  both planes belong to this window
+//   starting still binding
 function gatewayRuntimeState() {
   if (!isEnabled()) return "off";
   const states = [krsServer, cpsServer].filter(Boolean).map((s) => s.state);
@@ -4079,7 +4206,7 @@ function gatewayRuntimeState() {
   if (states.includes("standby")) return "standby";
   return "starting";
 }
-// 面板要显示是哪个端口出的问题，所以按平面分开报一份。
+// The panel needs to show which port the problem is on, so report one copy per plane.
 function gatewayPlaneStates() {
   return {
     krs: (krsServer && krsServer.state) || "idle",
@@ -4099,9 +4226,9 @@ function gatewayPlaneStates() {
 // and talk to AWS directly for that region.
 const REDIRECT_REGIONS = ["us-east-1", "eu-central-1"];
 // The regions to actually write, always including the active region so the
-// redirect can never miss the plane kiro-agent is really using. 自动识别的候选
-// 区域也一起写进去：识别结果随时可能从一个候选切到另一个，端点表提前覆盖全部
-// 候选，切换时就不必再等一次重载。
+// redirect can never miss the plane kiro-agent is really using. The candidates from auto-detection
+// are written in too: the detected result can switch from one candidate to another at any time, and covering every
+// candidate in the endpoint table ahead of time means a switch does not have to wait for another reload.
 function redirectRegions() {
   return [...new Set([getRegion(), ...REGION_CANDIDATES, ...REDIRECT_REGIONS]
     .map((r) => String(r || "").trim())
@@ -4251,8 +4378,8 @@ async function overrideEndpoint(key, port, backupKey) {
       + " source=effective-config");
     return { changed: false, ok: true };
   }
-  // 磁盘上已经是 127.0.0.1，但 Kiro 实际调用的是 get()。键没注册时 get() 一直是空的，
-  // 插件却把「磁盘对了」当成成功，模型列表和对话都继续走官方地址。
+  // Disk already says 127.0.0.1, but what Kiro actually calls is get(). When the key is not registered, get() stays empty,
+  // yet the extension treated "disk is right" as success, and the model list and the conversation kept going to the official address.
   if (diskMatches && hasHigherScopeConflict(cw, key, expected)) {
     log("!! active-profile endpoint is correct on disk but blocked by workspace/folder settings: " + fullEndpointKey(key));
     return { changed: false, ok: false };
@@ -4276,20 +4403,20 @@ async function overrideEndpoint(key, port, backupKey) {
     const effectiveOk = await waitForEndpointReadback(cw, key, expected);
     if (!effectiveOk && hasHigherScopeConflict(cw, key, expected)) {
       log("!! endpoint override blocked by workspace/folder settings: " + fullEndpointKey(key));
-      vscode.window.showErrorMessage(
+      vscode.window.showErrorMessage(tr(
         "Kiro Gateway: 工作区设置覆盖了 " + fullEndpointKey(key)
         + "，请删除工作区中的同名配置后重新加载窗口。"
-      );
+      ));
       return { changed: true, ok: false };
     }
     log("endpoint override verified via settings.json -> 127.0.0.1:" + port
       + (effectiveOk ? " (effective config updated)" : " (disk verified; reload required)"));
     return { changed: true, ok: true };
   }
-  vscode.window.showErrorMessage(
+  vscode.window.showErrorMessage(tr(
     "Kiro Gateway: 无法写入或验证 " + fullEndpointKey(key)
     + "。请打开日志查看实际 settings.json 路径。"
-  );
+  ));
   return { changed: false, ok: false };
 }
 async function restoreEndpoint(key, backupKey) {
@@ -4471,8 +4598,8 @@ function apiGetWithAuth(base, urlPath, auth, opts = {}) {
     req.end();
   });
 }
-// 带上状态码和响应体的错误：账号状态判定要靠状态码，不能从错误文本里正则捞
-// 数字（正文里随便一个 403 就会把正常账号判成失效）。
+// An error that carries the status code and the response body: account-state judgment needs the status code, and must not regex a
+// number out of the error text (any stray 403 in the body would mark a healthy account invalid).
 function httpError(status, body) {
   const text = String(body || "");
   const e = new Error("HTTP " + status + ": " + text.slice(0, 200));
@@ -4480,8 +4607,8 @@ function httpError(status, body) {
   e.body = text;
   return e;
 }
-// 单把密钥用哪个区域。自动模式下，和 profileArn 一致的缓存优先；缓存和
-// profile 矛盾（用量 200 误判）时直接用 profile 区域，不再听那个缓存。
+// Which region a single key uses. In automatic mode, a cache that agrees with profileArn comes first. When the cache and the
+// profile disagree (a usage 200 that was a wrong call), use the profile region directly and stop trusting that cache.
 function regionForKey(key) {
   const preferred = preferredRegionFor(key);
   if (preferred) return preferred;
@@ -4489,8 +4616,8 @@ function regionForKey(key) {
   if (home) return home;
   return configuredRegion();
 }
-// 针对某把密钥的控制面 GET。跨区拒绝（401/403/404）时，自动模式会现场识别一次
-// 再重试，省得把「区域填错」误判成「密钥失效」。
+// A control-plane GET for a particular key. On a cross-region refusal (401/403/404), automatic mode detects once on the spot
+// and retries, so "the region was filled in wrong" is not misjudged as "the key is invalid".
 async function cpsGetForKey(key, urlPath) {
   const k = String(key || getApiKey() || "").trim();
   const region = regionForKey(k);
@@ -4501,7 +4628,7 @@ async function cpsGetForKey(key, urlPath) {
   try { detected = (await detectRegionForKey(k)).region; } catch {}
   if (!detected || detected === region) return res;
   await rememberRegionFor(k, detected);
-  // 正在使用的那把密钥，识别结果同时落到全局配置，代理转发一起跟着切。
+  // The key currently in use. The detection result is also written to the global config, and proxy forwarding switches along with it.
   if (k === getApiKey()) await applyDetectedRegion(detected, { silent: true });
   return apiGet(managementBaseFor(detected), urlPath, k);
 }
@@ -4577,17 +4704,17 @@ async function testKey(key) {
 }
 
 // ---------------------------------------------------------------------------
-// 地区自动识别
+// Automatic region detection
 // ---------------------------------------------------------------------------
-// 密钥属于哪个区域，用它去各候选区域的 management 端点问一次最省事：
-//   2xx  → 这个区域认这把密钥，命中；
-//   429  → 认得但正被限流，作为备选（没有 2xx 时才用）；
-//   其它 → 不属于这个区域（403 就是典型的跨区拒绝）。
-// 探测走的是最轻的那个 GET（Get-Usage-Limits），不产生额度消耗。
+// Which region a key belongs to is cheapest to learn by asking each candidate region's management endpoint once with it:
+//   2xx  → this region recognizes the key; a hit;
+//   429  → it recognizes it but is being throttled; a fallback (used only when there is no 2xx);
+//   other → it does not belong to this region (403 is the typical cross-region refusal).
+// The probe is the lightest GET (Get-Usage-Limits) and does not consume quota.
 const REGION_PROBE_PATH = "/Get-Usage-Limits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST";
 const REGION_PROBE_TIMEOUT_MS = 8000;
-let _regionDetecting = null; // 进行中的探测 Promise，避免并发重复探测
-let _regionDetectBusy = false; // 面板要显示「探测中」，标志必须先于探测同步置起
+let _regionDetecting = null; // The probe Promise in flight, so concurrent probes are not duplicated
+let _regionDetectBusy = false; // The panel needs to show "detecting", so the flag has to be set synchronously before the probe
 function isRegionDetecting() {
   return _regionDetectBusy;
 }
@@ -4604,12 +4731,12 @@ async function probeRegion(region, key) {
       soft: status === 429,
     };
   } catch (e) {
-    // 域名不存在（ENOTFOUND）/ 超时都归到这里：这个区域不可用。
+    // A missing domain (ENOTFOUND) or a timeout both land here: this region is unavailable.
     return { region, status: 0, ms: Date.now() - started, hit: false, soft: false, error: e?.message || String(e) };
   }
 }
-// 用量接口在两个区域都可能 200。JSON 号有 profileArn 时以那个区域为准；
-// 没有 profile、又有多个 200 时，用「模型列表非空」把空区域排除掉。
+// The usage API can return 200 in both regions. When a JSON account has a profileArn, that region wins;
+// with no profile and more than one 200, use "the model list is non-empty" to rule out the empty region.
 async function detectRegionForKey(key) {
   const k = String(key || "").trim();
   if (!k) throw new Error("请先添加 API Key");
@@ -4621,8 +4748,8 @@ async function detectRegionForKey(key) {
   const results = await Promise.all(ordered.map((r) => probeRegion(r, k)));
   log("region 探测: " + results.map((r) => r.region + "=" + (r.status || (r.error || "err")) + "/" + r.ms + "ms").join(" "));
   const hits = results.filter((r) => r.hit);
-  // profileArn 区域只要用量接口认，就用它。另一个区域的 200 不能把号带走：
-  // 那边经常能查出套餐，但模型列表是空的。
+  // If the usage API recognizes the profileArn region, use it. A 200 from the other region must not carry the account away:
+  // that side can often report the plan, but the model list is empty.
   if (home && hits.some((r) => r.region === home)) return { region: home, results };
   if (home) {
     const homeResult = results.find((r) => r.region === home);
@@ -4657,11 +4784,11 @@ async function regionServesModels(key, region) {
     return false;
   }
 }
-// 自动模式下确保当前密钥的地区已识别。
-//   force = true  → 忽略缓存，重新探测（面板上的「重新识别」走这里）
-//   silent = true → 不弹 toast，只写日志（启动 / 切换密钥时的后台识别）
-// 识别结果写回 region 配置项，这样端点重定向、代理转发、状态栏全都自动跟着走，
-// 不需要在别处再判断一次自动模式。
+// In automatic mode, make sure the current key's region has been detected.
+//   force = true  → ignore the cache and probe again (the panel's "detect again" comes through here)
+//   silent = true → no toast, log only (background detection at startup or when switching keys)
+// The result is written back to the region setting, so endpoint redirect, proxy forwarding, and the status bar all follow on their own,
+// with no need to check automatic mode again somewhere else.
 async function ensureRegionDetected(opts = {}) {
   const { force = false, silent = true } = opts;
   if (!isRegionAuto() && !force) return null;
@@ -4675,7 +4802,7 @@ async function ensureRegionDetected(opts = {}) {
     }
   }
   if (_regionDetecting) return _regionDetecting;
-  // 先把「探测中」置起来再发请求，pushState 推出去的状态才是真的进行中。
+  // Set "detecting" before sending the request, so the state pushState sends out really is in progress.
   _regionDetectBusy = true;
   if (panelProvider) panelProvider.pushState();
   _regionDetecting = (async () => {
@@ -4705,8 +4832,8 @@ async function ensureRegionDetected(opts = {}) {
   })();
   return _regionDetecting;
 }
-// 把识别到的地区落到配置里。值没变就什么都不做，免得白写一次配置、白触发一次
-// applyState。
+// Write the detected region into config. If the value did not change, do nothing, so we do not write config for nothing or fire
+// applyState.
 async function applyDetectedRegion(region, opts = {}) {
   const r = String(region || "").trim();
   if (!r || r === configuredRegion()) return false;
@@ -4720,19 +4847,19 @@ async function applyDetectedRegion(region, opts = {}) {
   }
   return true;
 }
-// 生成请求撞到「鉴权失效」时，先怀疑是地区不对而不是密钥坏了：跨区拒绝和真失效
-// 的响应长得一样（都是 403 + access denied），只有换个区域再问一次才能区分。
-// 自动模式下后台复核一次，地区真的变了就把刚才那条失效判定撤掉，让这把密钥在新
-// 区域重新参与挑号。同一把密钥 60 秒内只复核一次，避免连续失败时反复探测。
+// When a generate request hits "authentication failed", suspect the region first, not a bad key: a cross-region refusal and a real failure
+// look the same (both are 403 + access denied), and only asking again in another region can tell them apart.
+// In automatic mode, recheck once in the background. If the region really changed, withdraw the invalid verdict just recorded, and let this key
+// join selection again in the new region. Recheck the same key at most once every 60 seconds, so repeated failures do not probe over and over.
 const REGION_RECHECK_MIN_GAP_MS = 60 * 1000;
-const _regionRecheckAt = new Map(); // key -> 上次复核时间
-// 切到一把还没探过区的号时补一次探测。
+const _regionRecheckAt = new Map(); // key -> last recheck time
+// When switching to an account whose region has not been probed, run one probe.
 //
-// 不补的话，regionForKey 会回退到全局值（也就是上一把号的区）。多把号分属不同区时
-// 这一发就打错了区，上游回的是 403 + 一句跟「凭证真坏了」一模一样的正文，号很容易
-// 被误标成已失效。转发路径有 cpsGetForKey 的跨区重试兜底，但那要先撞一次墙；这里
-// 提前把区探出来写进缓存，之后 regionForKey 直接命中，那一次墙就不用撞了。
-// 跟失败复核共用 _regionRecheckAt 的节流：两者要问的是同一件事，60 秒内只问一次。
+// Without it, regionForKey falls back to the global value (that is, the previous account's region). When several accounts belong to different regions,
+// this request hits the wrong region, and upstream returns a 403 plus body text identical to "the credential really is bad", so the account is easily
+// mislabeled invalid. The forwarding path has cpsGetForKey's cross-region retry as a fallback, but that has to hit the wall once first. Here,
+// probe the region ahead of time and write it into the cache. After that regionForKey hits directly, and that wall does not have to be hit.
+// Share _regionRecheckAt's throttle with the failure recheck: the two are asking the same question, so ask only once within 60 seconds.
 function ensureRegionForKeySoon(key) {
   if (!key || !isRegionAuto() || cachedRegionFor(key)) return;
   const last = Number(_regionRecheckAt.get(key) || 0);
@@ -4748,8 +4875,8 @@ function ensureRegionForKeySoon(key) {
     .catch(() => {});
 }
 function recheckRegionOnAuthFailure(key, kind) {
-  // denied 也要复核：原因不明的 403 里，"区域不匹配"占了很大一块，跟真失效的
-  // 响应长得一模一样。
+  // denied has to be rechecked too: among 403s with no clear reason, "region mismatch" is a large share, and compared with a real failure the
+  // response looks exactly the same.
   if ((kind !== "invalid" && kind !== "denied") || !isRegionAuto() || !key) return;
   const last = Number(_regionRecheckAt.get(key) || 0);
   if (Date.now() - last < REGION_RECHECK_MIN_GAP_MS) return;
@@ -4791,9 +4918,9 @@ function collectUsagePairs(node, out) {
   if (used != null || limit != null) out.push({ used, limit });
   for (const k of Object.keys(node)) collectUsagePairs(node[k], out);
 }
-// 额度重置时间。字段名在不同 Kiro 版本里换过好几轮，所以递归扫一遍，认到哪个
-// 算哪个；拿到的可能是 ISO 字符串、秒级或毫秒级时间戳，统一折成毫秒时间戳。
-// 有了这个值，"额度用尽"的冻结就能压到真正的重置时刻，而不是拍一个默认 TTL。
+// Quota reset time. The field name has changed across several rounds of Kiro versions, so scan recursively and take whichever one is recognized;
+// what comes back may be an ISO string, or a timestamp in seconds or milliseconds, and it is folded into a millisecond timestamp either way.
+// With this value, the freeze for "quota exhausted" can be held until the real reset moment, instead of a default TTL picked out of the air.
 const RESET_AT_FIELDS = [
   "nextDateReset", "nextResetDate", "resetDate", "resetAt", "resetTime",
   "usageLimitResetDate", "nextUsageResetDate", "renewalDate", "periodEnd",
@@ -4801,7 +4928,7 @@ const RESET_AT_FIELDS = [
 function normalizeResetAt(v) {
   if (v == null) return 0;
   if (typeof v === "number" && Number.isFinite(v)) {
-    // 10 位是秒、13 位是毫秒。小于 1e12 的一律按秒处理。
+    // 10 digits are seconds, 13 digits are milliseconds. Anything under 1e12 is treated as seconds.
     const ms = v < 1e12 ? v * 1000 : v;
     return ms > Date.now() ? Math.round(ms) : 0;
   }
@@ -4840,10 +4967,10 @@ function tierFromTitle(title) {
   if (t.includes("free")) return "free";
   return "other";
 }
-// 把用量响应解析成 { subscriptionTitle, tier, used, total, resetAt }。
-// 两条路共用这一份解析：插件主动探测（fetchAccountInfo），以及 Kiro 自己请求用量
-// 时的旁路嗅探（noteUsageFromBody）。认字段的方式必须一致，否则面板和 IDE 会各
-// 说一套数字。
+// Parse a usage response into { subscriptionTitle, tier, used, total, resetAt }.
+// Two paths share this parse: the extension probing on its own (fetchAccountInfo), and the side-path sniff when Kiro itself requests usage
+// (noteUsageFromBody). The way fields are recognized has to match, or the panel and the IDE will each
+// report a different set of numbers.
 function parseUsagePayload(data) {
   const title = data?.subscriptionInfo?.subscriptionTitle || data?.subscriptionInfo?.subscriptionType || "";
   const pairs = [];
@@ -4853,7 +4980,7 @@ function parseUsagePayload(data) {
     if (p.used != null) used = (used || 0) + p.used;
     if (p.limit != null) total = (total || 0) + p.limit;
   }
-  // 额度重置时间：有就带回去，"额度用尽"的冻结会压到这个时刻自动复检。
+  // Quota reset time: include it when present. The freeze for "quota exhausted" is held until that moment and then rechecked automatically.
   return { subscriptionTitle: title, tier: tierFromTitle(title), used, total, resetAt: findResetAt(data) };
 }
 // Fetch subscription tier + aggregate credit usage for a single key.
@@ -4895,8 +5022,8 @@ async function fetchAccountInfo(key) {
     throw e;
   }
 }
-// Kiro 自己请求用量时顺手记一笔。这是最新鲜的一手数据 —— IDE 那个百分比圆圈就是
-// 拿它画的 —— 用来更新账号状态和挑号要看的剩余额度，还能省掉插件自己再探一次。
+// When Kiro itself requests usage, record a note along the way. This is the freshest first-hand data — the percentage circle in the IDE is
+// drawn from it — and it is used to update account state and the remaining quota that selection looks at, and it can also save the extension a probe of its own.
 function noteUsageFromBody(key, bodyText) {
   if (!key || !bodyText) return;
   let data;
@@ -4908,40 +5035,40 @@ function noteUsageFromBody(key, bodyText) {
 }
 
 // ---------------------------------------------------------------------------
-// 后台账号巡检
+// Background account sweep
 // ---------------------------------------------------------------------------
-// 面板里那个 30 秒的账户同步跑在 webview 里，而 webview 一被隐藏就整个销毁 ——
-// 面板没开着的时候，账号状态只能靠"真实请求撞墙"被动更新：额度已经重置了看不
-// 出来、限流早就解了也不知道、当前这把号在别处被打满了照样一直用，撞一次墙才切。
+// The 30-second account sync in the panel runs inside the webview, and the webview is destroyed entirely the moment it is hidden —
+// while the panel is not open, account state can only be updated passively by "a real request hitting the wall": a quota that has already reset is invisible,
+// a throttle that lifted long ago is unknown, and the current account keeps being used even after it was filled up somewhere else. It switches only after hitting the wall once.
 //
-// 所以宿主端自己也要巡检，只是节奏放得很慢，并且跟面板共用一份"上次探测时间"，
-// 两边不会重复打同一把号。走的是最轻的那个用量 GET，不消耗额度。
+// So the host has to sweep on its own too, only on a much slower cadence, and it shares one "last probe time" with the panel,
+// so the two sides do not hit the same account twice. It uses the lightest usage GET and does not consume quota.
 const HEALTH_SWEEP_MS = 5 * 60 * 1000;
-const HEALTH_PROBE_MIN_GAP_MS = 4 * 60 * 1000; // 同一把号至少隔这么久才再探一次
-const HEALTH_SWEEP_MAX_KEYS = 6;               // 单轮最多探几把，号多时自然分摊到多轮
+const HEALTH_PROBE_MIN_GAP_MS = 4 * 60 * 1000; // The same account is probed again only after at least this long
+const HEALTH_SWEEP_MAX_KEYS = 6;               // At most this many accounts per round; when there are many, they spread across rounds on their own
 const HEALTH_SWEEP_CONCURRENCY = 3;
-const _keyProbeAt = new Map(); // key -> 上次探测时间（面板同步也会写这里）
+const _keyProbeAt = new Map(); // key -> last probe time (panel sync writes here too)
 let _healthTimer = null;
 let _healthSweeping = false;
 function noteKeyProbed(key) {
   if (key) _keyProbeAt.set(key, Date.now());
 }
-// 这一轮该探哪些号：当前在用的那把最优先（它的状态最要紧），其余按"最久没探过"
-// 排。冻结中的跳过 —— keyHealthFrozen 顺手会把到期的终态解掉，所以刚过复检窗口
-// 的号会在这里自动重新进入探测队列。
+// Which accounts this round should probe: the one currently in use comes first (its state matters most), and the rest are ordered by "unprobed the longest".
+// Skip ones that are frozen — keyHealthFrozen also clears a terminal state that has expired, so an account that just passed its recheck window
+// re-enters the probe queue here on its own.
 function keysDueForProbe() {
   const now = Date.now();
   const active = getApiKey();
   return getApiKeys()
     .filter((k) => {
       const st = (_keyHealth.get(k) || {}).state;
-      // 额度用尽 / 已禁用的照常探，不看冻结窗口。这两种正常会被自动删掉，还能出现在
-      // 列表里说明删除没落地（刚从落盘恢复的终态，或者上一次删失败了）。探一次有两
-      // 头好处：真探到 200 就当场翻案救回来（额度过了周期会自己恢复），仍然是坏的就
-      // 再触发一次删除。走的是免费的用量 GET，不烧额度。
+      // Quota-exhausted and suspended accounts are probed as usual, ignoring the freeze window. Those two are normally deleted automatically, and if they can still appear in
+      // the list, the deletion never landed (a terminal state just restored from disk, or the last delete failed). One probe helps in two
+      // ways: a real 200 reverses it on the spot and saves it (quota recovers on its own once the cycle turns), and if it is still bad it
+      // triggers deletion once more. It uses the free usage GET and does not burn quota.
       if (st === "quota" || st === "suspended") return true;
-      // 其余按老规矩：冻结中的跳过。keyHealthFrozen 顺手会把到期的终态解掉，所以刚
-      // 过复检窗口的号（比如被跨区误判成鉴权失效的）会在这里自动重新进入探测队列。
+      // The rest follow the old rule: skip ones that are frozen. keyHealthFrozen also clears a terminal state that has expired, so an account that just
+      // passed its recheck window (for example one misjudged as an auth failure across regions) re-enters the probe queue here on its own.
       return !keyHealthFrozen(k);
     })
     .filter((k) => k === active || now - Number(_keyProbeAt.get(k) || 0) >= HEALTH_PROBE_MIN_GAP_MS)
@@ -4953,7 +5080,7 @@ function keysDueForProbe() {
     .slice(0, HEALTH_SWEEP_MAX_KEYS);
 }
 async function healthSweepOnce() {
-  // 中转站模式没有多号概念；网关关着时也不用替 Kiro 官方服务操心。
+  // Relay mode has no notion of multiple accounts. When the gateway is off, there is also no need to worry about Kiro's official service on its behalf.
   if (_healthSweeping || isRelayMode() || !isEnabled()) return;
   if (getApiKeys().length < 1) return;
   _healthSweeping = true;
@@ -4971,7 +5098,7 @@ async function healthSweepOnce() {
         }
       }));
     }
-    // 探测结果可能让当前这把号变成不可用，顺手换一把，别等下一次请求撞墙。
+    // A probe result may make the current account unusable. Switch to another one along the way, instead of waiting for the next request to hit the wall.
     maybeAdoptUsableKey();
     if (panelProvider) panelProvider.pushStats();
   } finally {
@@ -4986,26 +5113,26 @@ function startHealthSweep() {
 function stopHealthSweep() {
   if (_healthTimer) { clearInterval(_healthTimer); _healthTimer = null; }
 }
-// 模式 / 开关 / 密钥变化后重新决定巡检要不要跑。
+// After the mode, the switch, or the keys change, decide again whether the sweep should run.
 function syncHealthSweep() {
   if (!isRelayMode() && isEnabled() && getApiKeys().length) startHealthSweep();
   else stopHealthSweep();
 }
 
 // ---------------------------------------------------------------------------
-// 存活探测 + 号变废自动删除
+// Liveness probe plus automatic deletion when an account goes dead
 // ---------------------------------------------------------------------------
-// 上面那套巡检走的是控制平面（用量 GET），不消耗额度，但有个盲区：账号被后端风控
-// 锁掉时往往只挡推理接口，用量查询照样回 200。表现就是号早就不能对话了，面板还
-// 显示「正常」，直到用户自己发一条消息撞上墙。
+// The sweep above goes through the control plane (a usage GET) and does not consume quota, but it has a blind spot: when an account is locked by backend risk control
+// it often blocks only the inference API, and the usage query still returns 200. What you see is an account that has long been unable to chat, while the panel still
+// shows "healthy", until the user sends a message and hits the wall.
 //
-// 所以这里再补一条走推理平面的真探活：POST runtime.{region}.kiro.dev 发一个最小的
-// GenerateAssistantResponse。代价是每次真探消耗一次生成请求，因此有两道闸：
-//   * 每把号最短 livenessRealCheckPerKeyIntervalSec 秒才被真探一次（默认 60 秒）
-//   * 已经冻结成终态的号不再探（终态不会自己翻案）
+// So add a real liveness probe that goes through the inference plane: POST runtime.{region}.kiro.dev with a minimal
+// GenerateAssistantResponse. The cost is that each real probe consumes one generate request, so there are two gates:
+//   * each account is really probed at most once every livenessRealCheckPerKeyIntervalSec seconds (60 seconds by default)
+//   * an account already frozen into a terminal state is not probed (a terminal state does not reverse itself)
 //
-// 探到号已经废了（被禁用 / 溢出上限打满 / 月配额用尽）就按配置直接从密钥列表删掉，
-// 省得用户回来一个个手工清。
+// When the probe finds the account is already dead (suspended, overage cap filled, or monthly quota exhausted), delete it from the key list according to the setting,
+// so the user does not have to come back and clear them one by one by hand.
 function getLivenessCheckEnabled() {
   return get("livenessCheckEnabled", false) === true;
 }
@@ -5013,37 +5140,37 @@ function getLivenessCheckIntervalSec() {
   const v = Math.round(Number(get("livenessCheckIntervalSec", 60)));
   return Number.isFinite(v) ? Math.min(Math.max(v, 10), 3600) : 60;
 }
-// 每号真探最短间隔。防止扫描过密时反复真探同一把号，把额度烧在探活上。
+// Minimum interval between real probes of one account. Stops a dense scan from really probing the same account over and over and burning quota on liveness checks.
 function getLivenessRealCheckPerKeyIntervalSec() {
   const v = Math.round(Number(get("livenessRealCheckPerKeyIntervalSec", 60)));
   return Number.isFinite(v) ? Math.min(Math.max(v, 10), 3600) : 60;
 }
-// 默认开：号废了就自动清出列表。留着一把已禁用 / 额度用尽的号没有任何用处 —— 它不
-// 参与挑号，只在面板上占一行红标，还要在每轮探活里被反复确认。要删的只有这三类
-// （见 DEAD_KINDS），鉴权失效刻意不在其中，那可能只是凭证输错或者跨区误判。
+// On by default: once an account is dead, clear it out of the list automatically. Keeping a suspended or quota-exhausted account is useless — it does not
+// take part in selection, it only occupies a red row on the panel, and it has to be reconfirmed on every liveness round. Only these three kinds are deleted
+// (see DEAD_KINDS). Authentication failure is deliberately not among them; that may only be a mistyped credential or a cross-region misjudgment.
 function getAutoDeleteOnDead() {
   return get("autoDeleteOnDead", true) !== false;
 }
-// 溢出上限特征。POWER 号打满 base + overage 之后，推理平面直接回 HTTP 400 +
-// __type=ServiceQuotaExceededException + reason=OVERAGE_REQUEST_LIMIT_EXCEEDED。
-// keyFailureKind 会把它归成通用 quota，但从用户视角这号已经彻底没救（只能等下个
-// 计费周期），单独一类方便面板计数和日志区分。
+// Signature of the overage cap. After a POWER account fills base plus overage, the inference plane returns HTTP 400 plus
+// __type=ServiceQuotaExceededException + reason=OVERAGE_REQUEST_LIMIT_EXCEEDED.
+// keyFailureKind folds it into generic quota, but from the user's point of view this account is beyond saving (they can only wait for the next
+// billing cycle). A separate kind makes panel counts and logs easier to tell apart.
 const OVERAGE_EXCEEDED_RE = /OVERAGE_REQUEST_LIMIT_EXCEEDED|reached the limit for overages/i;
-// 该被自动删的类别：
-//   suspended        账号被后端主动禁用
-//   overage_exceeded 溢出上限打满
-//   quota            月配额用尽
-// invalid 不进这个集合 —— 那可能只是凭证输错，删掉反而让用户丢了改正的机会。
-// network / unknown 也不进：网络抖动不算数。
+// Kinds that should be deleted automatically:
+//   suspended        the account was suspended by the backend on purpose
+//   overage_exceeded the overage cap is filled
+//   quota            the monthly quota is exhausted
+// invalid is not in this set — that may only be a mistyped credential, and deleting it would take away the user's chance to correct it.
+// network / unknown are not in it either: network jitter does not count.
 const DEAD_KINDS = new Set(["suspended", "overage_exceeded", "quota"]);
-// 每号上次真探的时间戳。只放内存，重载后立刻能重新真探一轮。
+// Timestamp of each account's last real probe. Memory only, so a reload can run a fresh real-probe round immediately.
 const _keyLastRealCheck = new Map();
 function forgetKeyLastRealCheck() {
   const alive = new Set(getApiKeys());
   for (const k of _keyLastRealCheck.keys()) if (!alive.has(k)) _keyLastRealCheck.delete(k);
 }
 
-// 单把号的真探活。请求形态沿用转发时那套通过实测的组合，别另起一套 headers。
+// A real liveness probe of a single account. The request shape follows the combination already proven in forwarding. Do not invent another set of headers.
 async function livenessCheckOne(key) {
   const region = cachedRegionFor(key) || getRegion();
   let hostname;
@@ -5052,8 +5179,8 @@ async function livenessCheckOne(key) {
   } catch {
     return { kind: "network", detail: "bad region " + region };
   }
-  // conversationId 每次都换，避免上游把探活当成延续对话累积到某个会话上，也避免
-  // 探活污染真正对话的历史。
+  // conversationId changes every time, so upstream does not treat the liveness probe as a continued conversation and accumulate it onto some session, and so the
+  // probe does not pollute the history of a real conversation.
   const rawBody = {
     conversationState: {
       chatTriggerType: "MANUAL",
@@ -5070,22 +5197,22 @@ async function livenessCheckOne(key) {
     let statusCode = 0;
     const bufs = [];
     let total = 0;
-    // 只读前 16KB 判定。生成响应是流式的，但判断"号通不通"最多看头部就够：
-    // 2xx + 早期正常帧 = ok；4xx = 立即错误；2xx + 早期错误帧 = 被禁用。
-    // 额度已经花了，多读只是浪费时间和内存。
+    // Decide from only the first 16KB. A generate response is streamed, but judging "is the account up" needs at most the head:
+    // 2xx plus an early normal frame = ok; 4xx = an immediate error; 2xx plus an early error frame = suspended.
+    // The quota has already been spent, and reading more only wastes time and memory.
     const READ_CAP = 16 * 1024;
     const finalize = () => {
       if (done) return;
       done = true;
       const raw = Buffer.concat(bufs).toString("utf8");
-      // 溢出上限优先识别：这是最硬的证据（__type 硬字段 + 特定 reason 常量），
-      // 无论状态码是什么，只要正文里出现就能确认这号废了。
+      // Recognize the overage cap first: this is the hardest evidence (a hard __type field plus a specific reason constant).
+      // Whatever the status code, if it appears in the body the account is confirmed dead.
       if (OVERAGE_EXCEEDED_RE.test(raw)) {
         resolve({ kind: "overage_exceeded", detail: "HTTP " + statusCode + " overage" });
         return;
       }
       if (statusCode >= 200 && statusCode < 300) {
-        // 2xx 也可能带流内错误帧：上游有时用 200 + 错误帧返回「已禁用」。
+        // A 2xx can also carry an in-stream error frame: upstream sometimes returns "suspended" as 200 plus an error frame.
         if (looksSuspended(failureEvidence(raw))) {
           resolve({ kind: "suspended", detail: "200+stream" });
           return;
@@ -5093,12 +5220,12 @@ async function livenessCheckOne(key) {
         resolve({ kind: "ok" });
         return;
       }
-      // 4xx / 5xx 沿用 keyFailureKind 的分类，跟转发失败、账户同步的口径完全一致。
+      // 4xx / 5xx reuse keyFailureKind's classification, on exactly the same terms as a forwarding failure and an account sync.
       const kind = keyFailureKind(statusCode, raw);
       if (kind === "suspended") { resolve({ kind: "suspended", detail: "HTTP " + statusCode }); return; }
       if (kind === "invalid") { resolve({ kind: "invalid", detail: "HTTP " + statusCode }); return; }
       if (kind === "quota") { resolve({ kind: "quota", detail: "HTTP " + statusCode }); return; }
-      // 限流说明号是活的，只是这一刻挤，不作结论。
+      // Throttling means the account is alive and only crowded at this moment, so draw no conclusion.
       if (kind === "throttle") { resolve({ kind: "unknown", detail: "HTTP " + statusCode + " throttle" }); return; }
       resolve({ kind: "unknown", detail: "HTTP " + statusCode });
     };
@@ -5118,10 +5245,10 @@ async function livenessCheckOne(key) {
           "x-amzn-codewhisperer-optout": "true",
           "content-length": bodyBuf.length,
         },
-        // 生成请求本来就慢，但真挂了也别耗太久。
+        // A generate request is slow to begin with, but if it really hangs, do not let it drag on too long.
         timeout: 25000,
-        // 探活刻意不进连接池：它会 req.destroy() 提前断流（收够头部就够判断了），
-        // 半途掐断的 socket 不该回到池子里污染正常请求。
+        // The liveness probe deliberately stays out of the connection pool: it calls req.destroy() to cut the stream early (the head is enough to judge),
+        // and a socket cut halfway must not go back into the pool and contaminate normal requests.
         agent: false,
       },
       (res) => {
@@ -5129,7 +5256,7 @@ async function livenessCheckOne(key) {
         res.on("data", (c) => {
           total += c.length;
           if (total <= READ_CAP) bufs.push(c);
-          // 收够头部就断连。destroy 会走 close 分支，done 标记保证不重复 resolve。
+          // Disconnect once the head is in. destroy goes through the close branch, and the done flag guarantees resolve is not called twice.
           if (total >= READ_CAP) { try { req.destroy(); } catch {} }
         });
         res.on("end", finalize);
@@ -5148,12 +5275,12 @@ async function livenessCheckOne(key) {
   })).catch((e) => ({ kind: "invalid", detail: e && e.message ? e.message : String(e) }));
 }
 
-// 探活扫描状态，面板显示用。
+// Liveness-scan state, for the panel to display.
 const _livenessState = {
   lastRunAt: 0,
   lastCounts: { ok: 0, suspended: 0, overage_exceeded: 0, invalid: 0, quota: 0, network: 0, unknown: 0, skipped: 0 },
-  lastDeleted: 0,   // 本次扫描删了几把
-  totalDeleted: 0,  // 本次会话累计删了几把
+  lastDeleted: 0,   // How many were deleted in this scan
+  totalDeleted: 0,  // How many have been deleted over this session
   running: false,
 };
 function livenessStateSnapshot() {
@@ -5166,35 +5293,35 @@ function livenessStateSnapshot() {
   };
 }
 
-// 自动删掉一把号，走跟面板删除同一套清理。
-// 激活的号被删且网关开着时要顺手关网关并提示重载：直接删不关，kiro-agent 那边看到
-// 的端点已经没有凭证可用，会连续报错。
+// Delete one account automatically, through the same cleanup the panel delete uses.
+// When the active account is deleted and the gateway is on, the gateway used to be turned off and a reload prompted: deleting without turning it off left kiro-agent looking at
+// an endpoint with no usable credential, and it would error continuously.
 async function deleteKeyAutomatic(key, reason) {
   const list = getApiKeys();
   const idx = list.indexOf(key);
   if (idx < 0) return { deleted: false, activeAffected: false };
   const removingActive = getActiveApiKey() === key;
   list.splice(idx, 1);
-  // 记一笔「刚删过这把」：号池（尤其拼车那种共享池）很可能立刻又把同一把发下来，
-  // 收它只是重走一遍导入 → 撞墙 → 判废 → 删除，白烧往返。
+  // Record "this one was just deleted": the pool (especially a shared carpool-style pool) is likely to hand the same one back down immediately,
+  // and accepting it only repeats import → hit the wall → mark dead → delete, wasting round trips.
   rememberDeadKey(key);
   await setApiKeys(list);
-  // forgetKeyHealth 已经把状态、冷却、用量、探测时间一并清掉了。原来这里还调了
-  // clearCooldown，那个会顺手写回一条 "ok"，等于给一把已经不在列表里的号留条脏记录。
+  // forgetKeyHealth has already cleared state, cooldown, usage, and probe time together. This used to also call
+  // clearCooldown, which writes an "ok" back as a side effect, leaving a dirty record for an account that is no longer in the list.
   forgetKeyHealth([key]);
   _keyLastRealCheck.delete(key);
   try { await syncKeyAddedAt(list); } catch {}
-  // silent：这条路径是后台探活触发的，不该弹原生对话框打断用户。
+  // silent: this path is triggered by a background liveness probe and should not pop a native dialog in the user's face.
   await applyState({ silent: true });
   maybeAdoptUsableKey();
   if (removingActive) {
-    // 删到正在用的那把也不关网关。
+    // Deleting the one currently in use no longer turns the gateway off either.
     //
-    // 原来这里是 set("enabled", false) 再提示重载。但号池自动续号随时会补新号进来，
-    // 网关一关，补回来的号就没地方落，用户还得手动再开一次 —— 而这条路径恰恰是全自动
-    // 补号最常撞上的：正在用的号烧完被删，紧接着续号就拉回来一把新的。
-    // 池子里还有号就切下一把；一把不剩就让它空转等续号 —— 反正号都废了，关不关网关都
-    // 发不出请求，开着反而能让补回来的号立刻接上。
+    // What used to be here was set("enabled", false) and then a prompt to reload. But a pool that refills accounts will bring a new one in at any time,
+    // and once the gateway is off the account that comes back has nowhere to land, so the user has to turn it on again by hand — and this path is exactly the one
+    // automatic refill hits most often: the account in use burns out and is deleted, and the refill pulls a new one in right after.
+    // If the pool still has accounts, switch to the next one. If none remain, let it idle and wait for a refill — the accounts are dead either way, and turning the gateway off or not,
+    // no request can go out. Leaving it on lets the account that comes back take over immediately.
     const tail = list.length
       ? "，网关保持开启并切到剩余可用号"
       : "，池子已空，网关保持开启等号池补号";
@@ -5202,8 +5329,8 @@ async function deleteKeyAutomatic(key, reason) {
   } else {
     log("[探活] 自动删除 " + maskKey(key) + "（" + reason + "）");
   }
-  // 不弹通知。删号本来就是全自动的，号池一补一删可能连着好几次，每次都弹一个框太吵，
-  // 而且这事不需要用户当场做任何决定。要追溯就去运行日志里看上面那两行。
+  // No notification. Deletion is fully automatic, and a pool that adds one and deletes one may do it several times in a row. A dialog every time is too noisy,
+  // and the user does not have to decide anything on the spot. To trace it, look at the two lines above in the run log.
   if (panelProvider) panelProvider.pushState();
   return { deleted: true, activeAffected: removingActive };
 }
@@ -5214,14 +5341,14 @@ const DEAD_KIND_LABEL = {
   overage_exceeded: "溢出额度已打满",
   quota: "额度已用尽",
 };
-// 一轮扫描：挑出该真探的号逐个探活，结果落到账号状态上，废号按配置删掉。
-// manual=true 时忽略每号最短间隔（用户自己点的按钮，代价他知道）。
+// One scan round: pick the accounts that should be really probed, probe them one by one, write the result onto account state, and delete dead accounts according to the setting.
+// manual=true ignores the per-account minimum interval (the user clicked the button themselves and knows the cost).
 async function runLivenessScan({ manual = false } = {}) {
   if (_livenessState.running) {
     if (manual) log("[探活] 上一轮还没跑完，本轮跳过");
     return { skipped: true };
   }
-  // 中转站模式没有多号概念；网关关着时也不必替 Kiro 官方服务操心。
+  // Relay mode has no notion of multiple accounts. When the gateway is off, there is also no need to worry about Kiro's official service on its behalf.
   if (!manual && (isRelayMode() || !isEnabled())) return { skipped: true };
   _livenessState.running = true;
   const counts = { ok: 0, suspended: 0, overage_exceeded: 0, invalid: 0, quota: 0, network: 0, unknown: 0, skipped: 0 };
@@ -5232,8 +5359,8 @@ async function runLivenessScan({ manual = false } = {}) {
     const perKeyMin = getLivenessRealCheckPerKeyIntervalSec() * 1000;
     const targets = [];
     for (const k of getApiKeys()) {
-      // 冻结成终态的号不再真探。但如果开着自动删号，终态里属于"废号"的那几种要放进来
-      // 探一次 —— 否则被巡检判成 quota 冻结的号永远等不到删除，一直躺在列表里。
+      // An account frozen into a terminal state is not really probed. But if automatic deletion is on, the terminal kinds that count as "dead accounts" are let in for
+      // one probe — otherwise an account the sweep froze as quota waits forever for deletion and just lies in the list.
       if (keyHealthFrozen(k, { silent: true })) {
         const st = (_keyHealth.get(k) || {}).state;
         if (!(getAutoDeleteOnDead() && DEAD_KINDS.has(st))) { counts.skipped++; continue; }
@@ -5253,34 +5380,34 @@ async function runLivenessScan({ manual = false } = {}) {
       for (const { key, r } of results) {
         counts[r.kind] = (counts[r.kind] || 0) + 1;
         if (r.kind === "ok") {
-          // 真探通了就是最硬的"这号能用"：连终态都可以靠它翻案，所以带 force。
-          // 额度用尽的号在计费周期重置后就是靠这一步自动救回来的。
+          // A real probe getting through is the hardest "this account can be used": even a terminal state can be reversed by it, so pass force.
+          // A quota-exhausted account is saved automatically by this step once the billing cycle resets.
           clearCooldown(key);
           setKeyHealth(key, "ok", { force: true });
           okKeys.push(key);
           continue;
         }
-        if (r.kind === "network" || r.kind === "unknown") continue; // 抖动不作结论
-        // 有结论的失败：记状态，让面板和挑号逻辑立刻知道。overage 归到 quota，
-        // 因为面板只认那几个状态名。
+        if (r.kind === "network" || r.kind === "unknown") continue; // Jitter draws no conclusion
+        // A failure that has a conclusion: record the state, so the panel and the selection logic know immediately. overage folds into quota,
+        // because the panel only recognizes those few state names.
         setKeyHealth(key, r.kind === "overage_exceeded" ? "quota" : r.kind);
         if (!getAutoDeleteOnDead() || !DEAD_KINDS.has(r.kind)) continue;
         const reason = (DEAD_KIND_LABEL[r.kind] || r.kind) + " · " + (r.detail || "");
         const out = await deleteKeyAutomatic(key, reason).catch(() => ({ deleted: false }));
         if (out.deleted) deleted++;
-        // 删到正在用的那把也不再关网关（见 deleteKeyAutomatic），所以这一轮不用中断。
-        // 剩下的号继续探完，一次扫描把废号一起清掉，比留到下一轮更省事。
+        // Deleting the one currently in use no longer turns the gateway off (see deleteKeyAutomatic), so this round does not have to be interrupted.
+        // Keep probing the remaining accounts. Clearing the dead ones in one scan is cheaper than leaving them for the next round.
       }
     }
-    // 探到活的号顺手刷一次用量：走控制平面 GET，不消耗生成额度，面板顶部的
-    // 已用 / 总量就不必等用户点「立即同步」。不 await，别拖住这一轮。
+    // When a live account is probed, refresh usage along the way: a control-plane GET, which does not consume generate quota, so the panel header's
+    // used / total does not have to wait for the user to click "sync now". Do not await it, and do not hold up this round.
     if (okKeys.length) {
       Promise.all(okKeys.map(async (k) => {
         try { noteAccountHealth(k, true, await fetchAccountInfo(k)); } catch {}
       })).then(() => { if (panelProvider) panelProvider.pushStats(); }).catch(() => {});
     }
-    // 正在用的那把可能刚被判成终态（标了但没删）：让可用的号接手，下一次请求
-    // 不必再撞同一面墙。自动切号关着时这个调用内部会自己跳过。
+    // The one currently in use may have just been judged terminal (marked, but not deleted): let an available account take over, so the next request
+    // does not have to hit the same wall. When automatic switching is off, this call skips itself internally.
     maybeAdoptUsableKey();
   } finally {
     _livenessState.running = false;
@@ -5309,7 +5436,7 @@ function startLivenessScheduler() {
     runLivenessScan().catch(() => {});
   }, getLivenessCheckIntervalSec() * 1000);
 }
-// 开关 / 间隔 / 模式 / 密钥变化后重新决定探活要不要跑。
+// After the switch, the interval, the mode, or the keys change, decide again whether the liveness probe should run.
 function syncLivenessScheduler() {
   if (getLivenessCheckEnabled() && !isRelayMode() && isEnabled() && getApiKeys().length) {
     startLivenessScheduler();
@@ -5319,45 +5446,45 @@ function syncLivenessScheduler() {
 }
 
 // ---------------------------------------------------------------------------
-// 自动续号（号池自动补号）
+// Automatic refill (the pool refills accounts on its own)
 // ---------------------------------------------------------------------------
-// 可用密钥（没在冷却、也没被判成终态）掉到阈值以下时，后台按节奏轮询用户配置的
-// 号池 API，把拉回来的 ksk_ 新号先验证一遍再导入。
+// When usable keys (not cooling down, and not judged terminal) drop below the threshold, poll the pool API the user configured, on a cadence,
+// and validate the new ksk_ accounts that come back before importing them.
 //
-// 几条关键约定：
-//   * 重复的 key 直接跳过、不计入成功次数。全是重复说明号池还没出新号，继续猛拉
-//     没有意义，所以这种情况进「重复 Key 冷却」，比普通轮询间隔压得更久。
-//   * 请求失败按指数退避（基础退避 × 2^n，夹到最大退避，再叠一个随机抖动），
-//     连续失败到阈值就熔断一段时间 —— 对面已经挂了还在死循环只会被拉黑。
-//   * 「最大轮询次数」是一次触发（掉到阈值以下）之内的上限，用完就停手；可用密钥
-//     恢复到阈值以上会自动复位，也可以在面板上点「立即续号」手动复位。
-//   * 号池接口五花八门，所以解析分两层：先按结构认（拼车队那种带 code / msg /
-//     data[].account 的 JSON，顺带能拿到区域和状态），认不出来再用正则把 ksk_
-//     开头的串捞出来，纯文本、一行一个的照样能吃。
-//   * 对面明确说「暂无可用号，正在补货」时按排队处理：既不算失败（不喂熔断）也不
-//     算重复（不进长冷却），按普通间隔继续等发车。
+// A few key conventions:
+//   * A duplicate key is skipped and does not count as a success. All duplicates means the pool has not produced a new account, and pulling hard
+//     means nothing, so this case enters "duplicate-key cooldown", held longer than the ordinary poll interval.
+//   * A failed request backs off exponentially (base backoff × 2^n, clamped to the max backoff, then a random jitter on top).
+//     Consecutive failures up to the threshold open the circuit for a while — if the other side is already down, spinning in a loop only gets you blocked.
+//   * "Max poll count" is the cap within one trigger (dropping below the threshold). Once it is used up, stop. When usable keys
+//     climb back above the threshold it resets on its own, and it can also be reset by hand with "refill now" on the panel.
+//   * Pool APIs come in every shape, so parsing has two layers: first recognize by structure (the carpool-team JSON with code / msg /
+//     data[].account, which can also carry region and status). If that fails, use a regex to pull out strings that start with ksk_.
+//     Plain text, one per line, is accepted the same way.
+//   * When the other side explicitly says "no account available right now, restocking", treat it as queued: it is neither a failure (it does not feed the circuit breaker) nor
+//     a duplicate (it does not enter the long cooldown). Keep waiting for dispatch at the ordinary interval.
 const RENEW_DEFAULTS = {
   enabled: false,
   apiUrl: "",
-  // 验证通过的新号是否直接写进密钥列表。关掉则先进「待导入」等用户确认。
+  // Whether a new account that passed validation is written straight into the key list. Off, it goes to "pending import" and waits for the user to confirm.
   autoImport: true,
-  // 持续囤号：开了就不看阈值，按轮询间隔一直去号池捞新号（号池出新号就收下）。
-  // 默认关 —— 只在号不够用时才补，对号池最客气。
+  // Keep stocking: when on, ignore the threshold and keep pulling new accounts from the pool at the poll interval (accept one whenever the pool produces one).
+  // Off by default — refill only when there are not enough accounts, which is the kindest to the pool.
   alwaysPoll: false,
-  threshold: 2,             // 触发阈值：可用密钥少于这个数就开始补
-  intervalSec: 60,          // 轮询间隔
-  maxRounds: 3,             // 最大轮询次数，用完停手
-  batchSize: 1,             // 单次批量数：一轮里发几次请求
-  requestGapSec: 5,         // 同轮请求间隔
-  backoffBaseSec: 30,       // 基础退避
-  backoffMaxSec: 300,       // 最大退避
-  breakerThreshold: 5,      // 连续失败熔断阈值
-  breakerCooldownSec: 300,  // 熔断冷却
-  dupCooldownSec: 600,      // 重复 Key 冷却
-  jitterPct: 10,            // 退避随机抖动
+  threshold: 2,             // Trigger threshold: start refilling when usable keys drop below this number
+  intervalSec: 60,          // Poll interval
+  maxRounds: 3,             // Max poll count; stop once it is used up
+  batchSize: 1,             // Batch size: how many requests to send in one round
+  requestGapSec: 5,         // Gap between requests in the same round
+  backoffBaseSec: 30,       // Base backoff
+  backoffMaxSec: 300,       // Max backoff
+  breakerThreshold: 5,      // Consecutive-failure threshold for opening the circuit
+  breakerCooldownSec: 300,  // Circuit-breaker cooldown
+  dupCooldownSec: 600,      // Duplicate-key cooldown
+  jitterPct: 10,            // Random jitter on the backoff
 };
-// 每个数值参数的取值区间。面板会夹一次，宿主这边再夹一次 —— 配置也可能是用户
-// 直接改 globalState 塞进来的。
+// The allowed range for each numeric parameter. The panel clamps once, and the host clamps once more — the config may also have been
+// stuffed in by the user editing globalState directly.
 const RENEW_LIMITS = {
   threshold: [1, 100],
   intervalSec: [5, 3600],
@@ -5371,39 +5498,39 @@ const RENEW_LIMITS = {
   dupCooldownSec: [0, 86400],
   jitterPct: [0, 100],
 };
-const RENEW_TICK_MS = 2000;              // 调度器心跳，只做时间比较，很便宜
-const RENEW_FETCH_TIMEOUT_MS = 20000;    // 单次号池请求超时
-const RENEW_BODY_CAP = 512 * 1024;       // 响应体读取上限，防止对面吐一个大文件
-// 号池返回什么格式都行，统一用这个正则捞 key。不含 base64 的 + / = ：那几个字符
-// 在 JSON / URL 里都可能是分隔符，宁可少捞也不要把结尾的标点吃进来。
+const RENEW_TICK_MS = 2000;              // Scheduler heartbeat. It only compares times, so it is cheap
+const RENEW_FETCH_TIMEOUT_MS = 20000;    // Timeout for a single pool request
+const RENEW_BODY_CAP = 512 * 1024;       // Cap on reading the response body, so the other side cannot dump a huge file
+// Whatever format the pool returns, this regex pulls keys out of it. It does not include base64's + / = : those characters
+// can all be separators in JSON or a URL. Better to pull one short than to swallow trailing punctuation.
 const RENEW_KEY_RE = /ksk_[A-Za-z0-9_-]{8,}/g;
-// 结构化响应里的 account.key 是单独一个字段，要整串匹配，不能用上面那个全局正则
-// （带 g 的正则有 lastIndex，反复 test 同一个会跳字符）。
+// account.key in a structured response is its own field and must be matched as a whole string, not with the global regex above
+// (a regex with g has lastIndex, and testing the same one repeatedly skips characters).
 const RENEW_KEY_ONE_RE = /^ksk_[A-Za-z0-9_-]{8,}$/;
-// zone 是区域缩写，只在没给完整 aws_region 时用得上。
+// zone is a region abbreviation, and it is only useful when a full aws_region was not given.
 const RENEW_ZONE_REGION = { us: "us-east-1", eu: "eu-central-1" };
-// 业务码：0 和 200 都是常见的「成功」写法，其余当失败看待。没给 code 的号池
-// （纯文本、一行一个）不参与这个判断。
+// Business codes: 0 and 200 are both common ways of writing "success". Anything else is treated as failure. A pool that gives no code
+// (plain text, one per line) does not take part in this check.
 const RENEW_OK_CODES = new Set([0, 200]);
 function renewCodeOk(code) {
   return code == null || RENEW_OK_CODES.has(Number(code));
 }
 
-// 有的号池（拼车队 / 发车那一类）返回的是带座位信息的结构化 JSON：
-//   { code: 0, msg: "已进「US Power 拼车队」拼车队列，但暂无可用号…",
+// Some pools (the carpool-team / dispatch kind) return structured JSON that carries seat information:
+//   { code: 0, msg: "joined the \"US Power carpool\" queue, but no account is available yet…",
 //     data: [ { claimId, channelId, channelName, seatNo, seatsTotal, claimType,
 //               claimTime, warrantyUntil,
 //               account: { key, zone, aws_region, status } } ] }
-// 比一串裸 key 多给了三样有用的东西：
-//   * account.aws_region —— 号属于哪个区直接写着，验号时不必再拿它去各候选区探
-//     一遍（那是一轮并发请求，能省就省）；
-//   * account.status —— 不是 active 的号连验都不用验，省一次往返；
-//   * code / msg —— 「正在补货，补到后自动为你发车」是排队而不是故障，只看 HTTP
-//     状态码会把它当失败往熔断上累，反而错过发车。
-// 认不出这个结构就返回 null，让调用方退回正则，谁的格式都还能吃。
-// status 的摆法不统一：有的号池写在 account 里，有的写在外层那一条上，字段名也
-// 可能是 state / accountStatus。两层都看一眼 —— 只从 account 里读的话，写在外层的
-// 状态会被读成空串，过滤时当成「号池没给状态」放行，不是 active 的号就漏进来了。
+// A bare string of keys would not have given these three useful things:
+//   * account.aws_region — which region the account belongs to is written outright, so validation does not have to probe every candidate region
+//     with it (that is a round of concurrent requests, so save it when you can);
+//   * account.status — an account that is not active does not even need to be validated, saving a round trip;
+//   * code / msg — "restocking, and it will be dispatched to you automatically once it arrives" is a queue, not a fault. Looking only at the HTTP
+//     status code would count it as a failure toward the circuit breaker, and the dispatch would be missed.
+// If this structure cannot be recognized, return null and let the caller fall back to the regex, so anyone's format can still be consumed.
+// status is not placed consistently: some pools write it inside account, some write it on the outer entry, and the field name may also
+// be state / accountStatus. Look at both layers — reading only from account would turn a status written on the outer layer into
+// an empty string, and the filter would treat that as "the pool gave no status" and let it through, so an account that is not active slips in.
 function renewStatusOf(row, acc) {
   const pick = (o) => {
     if (!o || typeof o !== "object") return "";
@@ -5414,7 +5541,7 @@ function renewStatusOf(row, acc) {
 }
 function renewRegionOf(account) {
   const full = String(account?.aws_region || account?.awsRegion || account?.region || "").trim();
-  // 完整区域名（us-east-1 / eu-central-1）直接可用。
+  // A full region name (us-east-1 / eu-central-1) can be used directly.
   if (/^[a-z]{2}-[a-z]+-\d+$/.test(full)) return full;
   const zone = String(account?.zone || "").trim().toLowerCase();
   return RENEW_ZONE_REGION[zone] || "";
@@ -5425,18 +5552,18 @@ function parseRenewPayload(body) {
   if (!j || typeof j !== "object") return null;
   const code = j.code == null ? null : Number(j.code);
   const msg = String(j.msg || j.message || "").trim();
-  // data 是常见写法，顶层直接是数组的也认。
+  // data is the common spelling, and a top-level array is recognized too.
   const rows = Array.isArray(j.data) ? j.data : Array.isArray(j) ? j : null;
-  // 三样都没有：不是这类响应，交给正则。
+  // None of the three is present: this is not that kind of response, so hand it to the regex.
   if (rows == null && code == null && !msg) return null;
   const items = [];
   const seen = new Set();
   for (const row of rows || []) {
     if (!row || typeof row !== "object") continue;
-    // 有 account 就从里面取，没有就当这一层自己带着 key（有的号池把号平铺在 data 里）。
+    // If there is an account, take it from there. If not, treat this layer as carrying the key itself (some pools lay accounts out flat inside data).
     const acc = row.account && typeof row.account === "object" ? row.account : row;
     const key = String(acc.key || acc.apiKey || "").trim();
-    // 补货中的条目 account 可能是 null，安全跳过。
+    // An entry that is still restocking may have a null account. Skip it safely.
     if (!RENEW_KEY_ONE_RE.test(key) || seen.has(key)) continue;
     seen.add(key);
     items.push({
@@ -5451,12 +5578,12 @@ function parseRenewPayload(body) {
       warrantyUntil: posNum(row.warrantyUntil),
     });
   }
-  // 最新领到的座位排前面：同一份响应里既有历史座位又有刚发车的新号时，先验新的。
+  // The most recently claimed seat comes first: when one response holds both historical seats and a newly dispatched account, validate the new one first.
   items.sort((a, b) => b.claimTime - a.claimTime);
   return { code, msg, items, rows: rows ? rows.length : 0, structured: true };
 }
-// 统一入口：结构化优先（能带上地区和状态），认不出结构或结构里一个号都没有就退回
-// 正则。不管走哪条路，出来的都是同一种条目形状。
+// One entry point: structure first (it can carry region and status). If the structure cannot be recognized, or the structure contains no accounts, fall back to the
+// regex. Whichever path is taken, what comes out is the same entry shape.
 function renewItemsFrom(body) {
   const parsed = parseRenewPayload(body);
   if (parsed && parsed.items.length) return parsed;
@@ -5465,10 +5592,10 @@ function renewItemsFrom(body) {
     claimId: 0, channelName: "", seatNo: 0, seatsTotal: 0, claimTime: 0, warrantyUntil: 0,
   }));
   if (!parsed) return { code: null, msg: "", items, rows: 0, structured: false };
-  // 结构认出来了但没号（正在补货）：保留 code / msg，调度那边要靠它区分排队和故障。
+  // The structure was recognized but there is no account (restocking): keep code / msg. The scheduler needs them to tell a queue apart from a fault.
   return { ...parsed, items };
 }
-// 座位信息压成一行，面板测试结果和日志共用。
+// Seat information is pressed into one line, shared by the panel's test result and the log.
 function renewItemNote(it) {
   const parts = [];
   if (it.channelName) parts.push(it.channelName);
@@ -5509,12 +5636,12 @@ async function setRenewPrefs(patch) {
     await setPref("renew_" + name, clampInt(p[name], RENEW_LIMITS[name], RENEW_DEFAULTS[name]));
   }
 }
-// 现在有几把能用的密钥。这就是「触发阈值」对着看的那个数：冷却中的、已失效 /
-// 额度用尽 / 已禁用的都不算。
+// How many usable keys there are right now. This is the number the "trigger threshold" is compared against: cooling down, invalid,
+// quota exhausted, and suspended do not count.
 function usableKeyCount() {
   return getApiKeys().filter((k) => keyIsUsable(k)).length;
 }
-// 号池测试列表里只要「认得出是哪一把」，所以只留前缀和后 4 位。
+// The pool's test list only needs "which one this is", so keep only the prefix and the last 4 characters.
 function maskRenewKey(k) {
   const s = String(k || "");
   if (s.length <= 8) return s;
@@ -5523,7 +5650,7 @@ function maskRenewKey(k) {
 function renewSleep(ms) {
   return new Promise((r) => setTimeout(r, Math.max(0, Number(ms) || 0)));
 }
-// 拉一次号池 API。走原生 http/https，因为号池地址可能是自建的 http 服务。
+// Pull the pool API once. Use the native http/https modules, because the pool address may be a self-hosted http service.
 function renewFetch(url) {
   return new Promise((resolve, reject) => {
     let target;
@@ -5565,7 +5692,7 @@ function renewFetch(url) {
     req.end();
   });
 }
-// 从响应正文里捞出去重后的 key，保持出现顺序。
+// Pull the deduplicated keys out of the response body, keeping the order they appeared in.
 function extractRenewKeys(body) {
   const out = [];
   const seen = new Set();
@@ -5578,8 +5705,8 @@ function extractRenewKeys(body) {
   }
   return out;
 }
-// 拉一次并把号整理出来，测试按钮和真正的轮询都走这里。
-// keys 保留是为了让只关心「有几把号」的调用方不用改写法。
+// Pull once and sort the accounts out. The test button and the real poll both come through here.
+// keys is kept so a caller that only cares "how many accounts" does not have to change how it is written.
 async function renewProbe(url) {
   const target = String(url || "").trim() || getRenewPrefs().apiUrl;
   if (!target) throw new Error("请先填写号池 API");
@@ -5596,12 +5723,12 @@ async function renewProbe(url) {
     keys: parsed.items.map((it) => it.key),
   };
 }
-// 验证一把新号：拿它去各候选地区问一次用量接口，2xx（或被限流的 429）说明这把号
-// 是真的，同时也就知道了它属于哪个地区。额度已经跑满的号不收 —— 补进来也用不了。
-// 这里刻意不写地区缓存：测试按钮也会走这个函数，不该污染缓存，落缓存放到导入之后。
-// hint.region：号池自己写明的区域（结构化响应里的 aws_region / zone）。先只探这
-// 一个，命中就省掉一整轮多区并发探测；没命中再退回全量探测 —— 号池写错区域的情况
-// 也得兜住。
+// Validate a new account: ask the usage API once in each candidate region with it. A 2xx (or a throttled 429) means the account
+// is real, and it also tells which region it belongs to. An account whose quota is already full is not accepted — importing it would not make it usable.
+// The region cache is deliberately not written here: the test button also goes through this function and must not pollute the cache. Caching happens after import.
+// hint.region: the region the pool itself wrote down (aws_region / zone in the structured response). Probe only this
+// one first, and a hit saves a whole round of multi-region concurrent probes. On a miss, fall back to a full probe — a pool that wrote the wrong region
+// has to be covered too.
 async function verifyRenewKey(key, hint) {
   const hinted = String(hint?.region || "").trim();
   let region = "";
@@ -5620,7 +5747,7 @@ async function verifyRenewKey(key, hint) {
   }
   if (!region) return { ok: false, region: "", info: null, message: "候选地区都不认这把 key" };
   let info = null;
-  // 拿不到套餐信息不影响判定（这个接口偶尔不给用），只是列表里少显示点东西。
+  // Failing to get plan information does not affect the judgment (this API occasionally refuses to be used). The list just shows a little less.
   try { info = await fetchAccountInfo(key); } catch {}
   const used = Number(info && info.used);
   const total = Number(info && info.total);
@@ -5629,42 +5756,42 @@ async function verifyRenewKey(key, hint) {
   }
   return { ok: true, region, info, message: "" };
 }
-// 把验证通过的新号并进密钥列表。entries: [{ key, region }]
+// Merge new accounts that passed validation into the key list. entries: [{ key, region }]
 async function importRenewKeys(entries) {
   const list = getApiKeys();
   const existing = new Set(list);
   const fresh = entries.filter((e) => e && e.key && !existing.has(e.key));
   if (!fresh.length) return 0;
   await setApiKeys([...list, ...fresh.map((e) => e.key)]);
-  // 新号从干净状态开始，别继承同一把 key 以前留下的终态。
+  // A new account starts from a clean state. Do not inherit a terminal state the same key left behind before.
   forgetKeyHealth(fresh.map((e) => e.key));
-  // 验证时已经探到地区了，顺手记下来，导入后第一次用就不必再探一遍。
+  // The region was already probed during validation, so record it along the way. The first use after import does not have to probe again.
   for (const e of fresh) {
     if (e.region) { try { await rememberRegionFor(e.key, e.region); } catch {} }
   }
   await applyState({ silent: true });
-  // 当前那把已经不可用时，让新号立刻接手。
+  // When the current one is already unusable, let the new account take over immediately.
   maybeAdoptUsableKey();
   if (panelProvider) panelProvider.pushState();
   return fresh.length;
 }
 
-// --- 待导入暂存区 -----------------------------------------------------------
-// 「自动导入」关掉时，验证通过的新号先落在这里，由用户在面板上点确认才进密钥
-// 列表。有人不愿意让插件自己往列表里塞号（比如想先看看是哪个区、什么套餐），
-// 这块暂存区就是给这种用法的。
+// --- Pending-import holding area -----------------------------------------------------------
+// When "auto import" is off, a new account that passed validation lands here first, and enters the key
+// list only when the user confirms it on the panel. Some people do not want the extension stuffing accounts into the list on its own (for example they want to see the region and the plan first),
+// and this holding area is for that use.
 //
-// 落盘而不是只放内存：拉到的号重载窗口后还在，否则等于白拉一趟。存的是明文
-// key —— 和 apiKeys 本身一样（那也是明文配置项），没有引入新的暴露面。
+// Persist it instead of keeping it only in memory: an account that was pulled is still there after a window reload, or the pull was wasted. What is stored is the key in plaintext
+// — the same as apiKeys itself (that is a plaintext config item too), so this introduces no new exposure.
 const RENEW_PENDING_STATE_KEY = "kiroGateway.renewPending";
-const RENEW_PENDING_CAP = 50; // 上限：没人来确认时也不会无限堆下去
+const RENEW_PENDING_CAP = 50; // Cap: it will not pile up without limit when nobody comes to confirm
 let _renewPending = []; // [{ key, region, title, used, total, note, at }]
 function loadRenewPending() {
   if (!extContext) return;
   let saved = null;
   try { saved = extContext.globalState.get(RENEW_PENDING_STATE_KEY); } catch {}
   if (!Array.isArray(saved)) return;
-  // 已经手动加进密钥列表的、以及重复条目，加载时顺手清掉。
+  // Ones already added to the key list by hand, and duplicate entries, are cleared along the way on load.
   const skip = new Set(getApiKeys());
   const out = [];
   for (const e of saved) {
@@ -5689,7 +5816,7 @@ async function saveRenewPending() {
   if (!extContext) return;
   try { await extContext.globalState.update(RENEW_PENDING_STATE_KEY, _renewPending); } catch {}
 }
-// 面板要显示的形状。带上完整 key：面板据它来点「导入这一个」，跟密钥列表的做法一致。
+// The shape the panel needs to display. It carries the full key: the panel uses it to click "import this one", the same way the key list does.
 function renewPendingSnapshot() {
   return _renewPending.map((e) => ({
     key: e.key,
@@ -5702,16 +5829,16 @@ function renewPendingSnapshot() {
     at: e.at,
   }));
 }
-// 重复判定要连暂存区一起看，否则已经暂存、还没确认的号会在下一轮被当成新号，
-// 白验一次往返。
+// Duplicate detection has to look at the holding area too, or an account already held and not yet confirmed is treated as new on the next round,
+// and a round trip is spent validating it for nothing.
 function renewKnownKeys() {
-  // 刚被自动删掉的坏号也算「已知」：号池很可能立刻又把同一把发下来，收它只是再走一
-  // 遍导入 → 撞墙 → 判死 → 删除。过了记忆期还给同一把就再收，那时额度可能真重置了。
+  // A bad account that was just deleted automatically also counts as "known": the pool is likely to hand the same one back down immediately, and accepting it only walks
+  // import → hit the wall → mark dead → delete one more time. If the same one comes back after the memory window, accept it again; the quota may have really reset by then.
   const dead = [];
   for (const k of [..._deadKeyAt.keys()]) if (isRecentlyDeadKey(k)) dead.push(k);
   return new Set([...getApiKeys(), ..._renewPending.map((e) => e.key), ...dead]);
 }
-// 验证通过的号进暂存区。entries: [{ key, region, info }]
+// Accounts that passed validation go into the holding area. entries: [{ key, region, info }]
 async function stashRenewKeys(entries) {
   const known = renewKnownKeys();
   const add = [];
@@ -5730,13 +5857,13 @@ async function stashRenewKeys(entries) {
     });
   }
   if (!add.length) return 0;
-  // 新的排前面，超出上限时丢最旧的那些。
+  // New ones go in front. When the cap is exceeded, drop the oldest.
   _renewPending = [...add, ..._renewPending].slice(0, RENEW_PENDING_CAP);
   await saveRenewPending();
   if (panelProvider) panelProvider.pushState();
   return add.length;
 }
-// 从暂存区导入。keys 为空 = 全部导入。
+// Import from the holding area. An empty keys means import all of them.
 async function importPendingKeys(keys) {
   const want = Array.isArray(keys) && keys.length ? new Set(keys.map(String)) : null;
   const picked = _renewPending.filter((e) => !want || want.has(e.key));
@@ -5748,7 +5875,7 @@ async function importPendingKeys(keys) {
   if (panelProvider) panelProvider.pushState();
   return n;
 }
-// 丢弃暂存区里的号。keys 为空 = 全部丢弃。
+// Discard accounts in the holding area. An empty keys means discard all of them.
 async function dropPendingKeys(keys) {
   const want = Array.isArray(keys) && keys.length ? new Set(keys.map(String)) : null;
   const before = _renewPending.length;
@@ -5758,8 +5885,8 @@ async function dropPendingKeys(keys) {
   if (panelProvider) panelProvider.pushState();
   return before - _renewPending.length;
 }
-// 验证通过的新号该去哪：自动导入就直接进密钥列表，否则进暂存区等确认。
-// 返回 { imported, stashed }，调用方据此写日志和决定下一轮的节奏。
+// Where a new account that passed validation should go: auto-import writes it straight into the key list, otherwise it waits in the holding area for confirmation.
+// Returns { imported, stashed }. The caller uses that to write the log and decide the cadence of the next round.
 async function deliverRenewKeys(entries) {
   if (getRenewPrefs().autoImport) {
     return { imported: await importRenewKeys(entries), stashed: 0 };
@@ -5767,31 +5894,31 @@ async function deliverRenewKeys(entries) {
   return { imported: 0, stashed: await stashRenewKeys(entries) };
 }
 
-// --- 调度 -------------------------------------------------------------------
-// phase 就是面板上那行状态：
-//   off      没启用，或者号池 API 还没填
-//   idle     可用密钥够用，待命
-//   waiting  低于阈值，等下一次轮询
-//   polling  正在拉号
-//   backoff  上一轮失败，退避中
-//   dup      拉到的全是重复，重复 Key 冷却中
-//   pending  自动导入关着，暂存区已有号在等用户确认，先不拉了
-//   breaker  连续失败触发熔断，冷却中
-//   stopped  最大轮询次数用完，停手
+// --- Scheduling -------------------------------------------------------------------
+// phase is the status line on the panel:
+//   off      not enabled, or the pool API has not been filled in
+//   idle     enough usable keys, standing by
+//   waiting  below the threshold, waiting for the next poll
+//   polling  pulling accounts
+//   backoff  the last round failed, backing off
+//   dup      everything pulled was a duplicate, in duplicate-key cooldown
+//   pending  auto-import is off, and the holding area already has accounts waiting for the user to confirm, so stop pulling for now
+//   breaker  consecutive failures opened the circuit, cooling down
+//   stopped  the max poll count is used up, stopped
 let _renewTimer = null;
-let _renewBusy = false;   // 一轮正在跑，心跳不要叠上去
-let _renewForce = false;  // 面板点了「立即续号」：忽略阈值和停手状态，跑一轮
+let _renewBusy = false;   // A round is already running; do not stack the heartbeat on top of it
+let _renewForce = false;  // The panel's "refill now" was clicked: ignore the threshold and the stopped state, and run one round
 let _renew = {
   phase: "off",
-  rounds: 0,          // 本次触发已经跑了几轮
-  fails: 0,           // 连续失败次数（熔断用）
-  nextAt: 0,          // 下一轮的时间点
+  rounds: 0,          // How many rounds this trigger has already run
+  fails: 0,           // Consecutive failure count (for the circuit breaker)
+  nextAt: 0,          // When the next round is due
   breakerUntil: 0,
   dupUntil: 0,
-  imported: 0,        // 本次触发累计导入了几把
-  stashed: 0,         // 本次触发累计暂存了几把（自动导入关着时）
-  lastAt: 0,          // 上一轮结束时间
-  lastMessage: "",    // 上一轮结果，面板直接显示
+  imported: 0,        // How many this trigger has imported in total
+  stashed: 0,         // How many this trigger has stashed in total (when auto-import is off)
+  lastAt: 0,          // When the last round ended
+  lastMessage: "",    // Result of the last round, shown directly on the panel
 };
 function resetRenewCounters() {
   _renew.rounds = 0;
@@ -5822,17 +5949,17 @@ function renewStatusSnapshot() {
     breakerMs: Math.max(0, _renew.breakerUntil - now),
     dupMs: Math.max(0, _renew.dupUntil - now),
     lastAt: _renew.lastAt,
-    lastMessage: _renew.lastMessage,
+    lastMessage: tr(_renew.lastMessage || ""),
   };
 }
 function setRenewPhase(phase) {
   if (_renew.phase === phase) return;
   _renew.phase = phase;
-  // 状态跟着统计一起推：面板每几秒拉一次 stats，倒计时因此能自己走。
+  // State is pushed along with the stats: the panel pulls stats every few seconds, so the countdown moves on its own.
   if (panelProvider) panelProvider.pushStats();
 }
-// 指数退避：基础退避 × 2^(连续失败-1)，夹到最大退避，再叠一个 ±抖动%。
-// 抖动是为了让多个客户端不齐刷刷地在同一秒重试。
+// Exponential backoff: base backoff × 2^(consecutive failures − 1), clamped to the max backoff, then ±jitter% on top.
+// The jitter keeps several clients from retrying in the same second, all at once.
 function renewBackoffMs(p, fails) {
   const base = Math.max(1000, p.backoffBaseSec * 1000);
   const max = Math.max(base, p.backoffMaxSec * 1000);
@@ -5841,30 +5968,30 @@ function renewBackoffMs(p, fails) {
   if (jitter <= 0) return Math.round(grown);
   return Math.max(1000, Math.round(grown + grown * jitter * (Math.random() * 2 - 1)));
 }
-// 现在该显示哪个 phase。心跳的判断和一轮跑完后的即时刷新共用这一套规则，
-// 两处的措辞才不会打架。"due" 表示到点了该拉，只有心跳会用到它。
+// Which phase to show right now. The heartbeat's judgment and the immediate refresh after a round share this set of rules,
+// so the wording in the two places does not fight. "due" means it is time to pull, and only the heartbeat uses it.
 function computeRenewPhase(p, now = Date.now()) {
   if (!p.apiUrl || !p.enabled) return "off";
-  // 持续囤号不看阈值：号池出了新号就收下，跟当前够不够用无关。
+  // Keep-stocking ignores the threshold: accept a new account whenever the pool produces one, whether or not there are enough right now.
   if (!p.alwaysPoll && usableKeyCount() >= p.threshold) return "idle";
-  // 自动导入关着、暂存区里已经躺着号：活儿干完了，就差确认，别接着拉号池。
+  // Auto-import is off and accounts are already sitting in the holding area: the work is done and only confirmation is left, so do not keep pulling the pool.
   if (!p.autoImport && _renewPending.length > 0) return "pending";
   if (now < _renew.breakerUntil) return "breaker";
   if (now < _renew.dupUntil) return "dup";
-  // 「最大轮询次数」是补到够用就停手的保险，持续囤号本来就没有终点，不受它限制。
-  // 熔断和退避照旧生效 —— 那两个护的是号池，任何模式都不能省。
+  // "Max poll count" is the safety stop for "refill until there are enough, then stop". Keep-stocking has no endpoint to begin with, so it is not limited by it.
+  // The circuit breaker and the backoff still apply — those two protect the pool, and no mode gets to skip them.
   if (!p.alwaysPoll && _renew.rounds >= p.maxRounds) return "stopped";
   if (now < _renew.nextAt) return _renew.fails > 0 ? "backoff" : "waiting";
   return "due";
 }
-// 跑一轮：按「单次批量数」发若干次请求，每次之间隔「同轮请求间隔」。
-// 只负责拉 + 验 + 导入，节奏决策交给 runRenewRound。
-// force：来自面板的「立即续号」，这一轮不受启用开关约束。
+// Run one round: send several requests according to "batch size", with "gap between requests in the same round" between them.
+// This only pulls, validates, and imports. Cadence decisions are left to runRenewRound.
+// force: "refill now" from the panel. This round is not constrained by the enable switch.
 async function pollRenewOnce(p, force) {
   const r = { found: 0, dup: 0, invalid: 0, errors: 0, imported: 0, stashed: 0, queued: 0, notes: [] };
   for (let i = 0; i < p.batchSize; i++) {
     if (i > 0 && p.requestGapSec > 0) await renewSleep(p.requestGapSec * 1000);
-    // 等待期间用户可能把开关关掉了，别接着打。
+    // The user may have turned the switch off while we were waiting. Do not keep hitting it.
     if (!force && !getRenewPrefs().enabled) break;
     let probe;
     try {
@@ -5879,16 +6006,16 @@ async function pollRenewOnce(p, force) {
       r.notes.push("HTTP " + probe.status);
       continue;
     }
-    // 业务码失败而且一个号都没给：HTTP 是 200，但对面明确说不行（队列满、令牌
-    // 过期之类），拿 msg 当原因比「响应里没有 key」有用得多。
+    // The business code failed and not a single account was given: HTTP is 200, but the other side explicitly said no (queue full, token
+    // expired, and the like). Using msg as the reason is much more useful than "the response contained no key".
     if (!renewCodeOk(probe.code) && !probe.items.length) {
       r.errors++;
       r.notes.push(probe.msg || "号池返回业务码 " + probe.code);
       continue;
     }
     if (!probe.items.length) {
-      // 「已进拼车队列，暂无可用号，正在补货，补到后自动为你发车」是正常排队：
-      // 按等号处理，不往熔断上累 —— 否则几轮就停手，反而错过发车。
+      // "Joined the carpool queue, no account available yet, restocking, and it will be dispatched to you automatically once it arrives" is a normal queue:
+      // treat it as waiting for an account, and do not accumulate it toward the circuit breaker — otherwise a few rounds and it stops, and the dispatch is missed.
       if (probe.structured) {
         r.queued++;
         r.notes.push(probe.msg || "号池暂无可用号");
@@ -5898,13 +6025,13 @@ async function pollRenewOnce(p, force) {
       }
       continue;
     }
-    // 只收 status 是 active 的号：号池标了状态而不是 active 的，连验都不用验。
-    // 完全没给 status 的（纯文本号池、一行一个 ksk_）没法判断，照旧放行 —— 那种
-    // 号池要是也拦掉，就一个号都收不到了。
+    // Accept only accounts whose status is active: if the pool set a status and it is not active, do not even validate it.
+    // One that gave no status at all (a plain-text pool, one ksk_ per line) cannot be judged, so let it through as before — if that kind of
+    // pool were blocked too, not a single account would be accepted.
     const alive = probe.items.filter((it) => !it.status || it.status === "active");
     const skipped = probe.items.filter((it) => it.status && it.status !== "active");
     if (skipped.length) {
-      // 把具体状态列出来，方便对着号池的文档确认过滤是不是拦对了。
+      // List the concrete statuses, so it is easy to check against the pool's docs whether the filter blocked the right ones.
       const kinds = [...new Set(skipped.map((it) => it.status))];
       r.notes.push(skipped.length + " 个号状态不是 active（" + kinds.join(" / ") + "），已跳过");
       log("自动续号: 跳过 " + skipped.length + " 个非 active 的号（" + kinds.join(" / ") + "）");
@@ -5914,15 +6041,15 @@ async function pollRenewOnce(p, force) {
       continue;
     }
     r.found += alive.length;
-    // 重复的直接跳过，一次往返都不浪费。已经在待导入暂存区里的也算重复 ——
-    // 不然没确认导入的那些号每轮都会被重新验一遍。
+    // A duplicate is skipped, and not one round trip is wasted. One already in the pending-import holding area counts as a duplicate too —
+    // otherwise accounts that were never confirmed would be validated all over again every round.
     const known = renewKnownKeys();
     const fresh = alive.filter((it) => !known.has(it.key));
     r.dup += alive.length - fresh.length;
     if (!fresh.length) continue;
     const good = [];
     for (const it of fresh) {
-      // 条目本身就带着号池写明的区域，验号时直接用，省掉一轮多区探测。
+      // The entry itself carries the region the pool wrote down. Use it directly when validating, and save a round of multi-region probes.
       const v = await verifyRenewKey(it.key, it);
       if (v.ok) {
         good.push({ key: it.key, region: v.region, info: v.info, note: renewItemNote(it) });
@@ -5941,13 +6068,13 @@ async function pollRenewOnce(p, force) {
   }
   return r;
 }
-// 一轮的完整流程：跑 + 根据结果决定下一次什么时候来。
+// The full flow of one round: run, then decide from the result when to come back next.
 async function runRenewRound(p, force) {
   _renew.rounds++;
   const r = await pollRenewOnce(p, force);
   const now = Date.now();
-  // 有号进来就算这一轮有收获。「自动导入」关着时号落在待导入暂存区，同样算收获：
-  // 该做的活儿都干完了，只差用户点一下确认。
+  // If any account came in, this round had a yield. When "auto import" is off the accounts land in the pending-import holding area, and that still counts as a yield:
+  // the work that had to be done is done, and only a confirmation click from the user is left.
   if (r.imported > 0 || r.stashed > 0) {
     _renew.imported += r.imported;
     _renew.stashed += r.stashed;
@@ -5962,9 +6089,9 @@ async function runRenewRound(p, force) {
     log("自动续号: 第 " + _renew.rounds + " 轮 " + _renew.lastMessage);
     return;
   }
-  // 号池明确说了在排队 / 补货（结构化响应里 data 是空的）：这既不是失败也不是
-  // 重复，按普通轮询间隔继续等就行 —— 发车是对面推的，等的就是那一下，压太久
-  // 反而白等。连续失败计数保持清零，不让排队把熔断喂饱。
+  // The pool explicitly said it is queued or restocking (data is empty in the structured response): this is neither a failure nor a
+  // duplicate. Keep waiting at the ordinary poll interval — dispatch is pushed by the other side, and that moment is what we are waiting for. Holding too long
+  // only means waiting for nothing. Keep the consecutive-failure count at zero, so a queue does not feed the circuit breaker full.
   if (r.queued > 0 && r.errors === 0 && r.invalid === 0 && r.dup === 0) {
     _renew.fails = 0;
     _renew.nextAt = now + p.intervalSec * 1000;
@@ -5973,17 +6100,17 @@ async function runRenewRound(p, force) {
     log("自动续号: 第 " + _renew.rounds + " 轮 " + _renew.lastMessage);
     return;
   }
-  // 一把都没进来。全是重复说明号池还没出新号：这不算失败，不该触发熔断。
+  // Not a single one came in. All duplicates means the pool has not produced a new account: this is not a failure and should not open the circuit.
   if (r.dup > 0 && r.errors === 0 && r.invalid === 0) {
     _renew.fails = 0;
     if (p.alwaysPoll) {
-      // 持续囤号模式下重复是常态（号池就守着那几个号），不该按十分钟压住 ——
-      // 「守在号池边上等新号」本来就是这个模式的用途，按普通间隔继续看就行。
+      // In keep-stocking mode, duplicates are the normal case (the pool is just sitting on those few accounts) and should not be held down for ten minutes —
+      // "waiting beside the pool for a new account" is what this mode is for, so keep looking at the ordinary interval.
       _renew.nextAt = now + p.intervalSec * 1000;
       _renew.lastMessage = "拉到的 " + r.dup + " 个 key 全是重复，"
         + p.intervalSec + " 秒后再看一次";
     } else {
-      // 只在缺号时才补的模式下，全是重复意味着这一趟白跑，压久一点再来。
+      // In the mode that refills only when accounts are short, all duplicates means this trip was wasted, so hold longer before coming back.
       _renew.dupUntil = now + p.dupCooldownSec * 1000;
       _renew.nextAt = _renew.dupUntil;
       _renew.lastMessage = "拉到的 " + r.dup + " 个 key 全是重复，冷却 " + p.dupCooldownSec + " 秒";
@@ -5991,7 +6118,7 @@ async function runRenewRound(p, force) {
     log("自动续号: 第 " + _renew.rounds + " 轮 " + _renew.lastMessage);
     return;
   }
-  // 真失败：退避，并累计连续失败次数。
+  // A real failure: back off, and accumulate the consecutive-failure count.
   _renew.fails++;
   const note = r.notes.slice(0, 3).join("；") || "没拿到可用的新 key";
   if (_renew.fails >= p.breakerThreshold) {
@@ -6007,7 +6134,7 @@ async function runRenewRound(p, force) {
   }
   log("自动续号: 第 " + _renew.rounds + " 轮失败 — " + _renew.lastMessage);
 }
-// 心跳：绝大多数时候只做几次时间比较就返回。
+// Heartbeat: most of the time it only compares a few times and returns.
 async function renewTick() {
   if (_renewBusy) return;
   const p = getRenewPrefs();
@@ -6020,14 +6147,14 @@ async function renewTick() {
   if (!force) {
     const phase = computeRenewPhase(p);
     if (phase === "idle") {
-      // 补够了：把这次触发的计数全部复位，等下次掉下去重新开始。
+      // Enough have been refilled: reset every counter for this trigger, and start over the next time it drops.
       if (_renew.rounds || _renew.fails || _renew.nextAt || _renew.breakerUntil || _renew.dupUntil) {
         resetRenewCounters();
       }
       setRenewPhase("idle");
       return;
     }
-    // 只有「到点了该拉」才往下走，其余几种都是在等。
+    // Only "it is time to pull" continues. Every other case is waiting.
     if (phase !== "due") { setRenewPhase(phase); return; }
   }
   _renewForce = false;
@@ -6041,8 +6168,8 @@ async function renewTick() {
   } finally {
     _renewBusy = false;
     _renew.lastAt = Date.now();
-    // 立刻按新的计数算出该显示什么，别让面板等到下一次心跳。这里一定不会是
-    // "due"：不管成功、重复还是失败，上面都把 nextAt 推到了将来。
+    // Immediately compute what should be shown from the new counters, and do not make the panel wait for the next heartbeat. This will never be
+    // "due": success, duplicate, or failure, the code above has already pushed nextAt into the future.
     const next = computeRenewPhase(getRenewPrefs());
     _renew.phase = next === "due" ? "waiting" : next;
     if (panelProvider) panelProvider.pushStats();
@@ -6056,7 +6183,7 @@ function startRenewLoop() {
 function stopRenewLoop() {
   if (_renewTimer) { clearInterval(_renewTimer); _renewTimer = null; }
 }
-// 开关或参数变动后调用：开着就确保心跳在跑，关了就停下来。
+// Called after the switch or a parameter changes: if it is on, make sure the heartbeat is running; if it is off, stop it.
 function syncRenewLoop() {
   const p = getRenewPrefs();
   if (p.enabled && p.apiUrl) {
@@ -6066,26 +6193,26 @@ function syncRenewLoop() {
     setRenewPhase("off");
   }
 }
-// 面板上的「立即续号」：清掉退避 / 熔断 / 停手状态，忽略阈值立刻跑一轮。
+// "Refill now" on the panel: clear the backoff, the circuit breaker, and the stopped state, ignore the threshold, and run one round immediately.
 async function renewKickNow() {
   const p = getRenewPrefs();
   if (!p.apiUrl) throw new Error("请先填写号池 API");
   resetRenewCounters();
   _renewForce = true;
   _renew.lastMessage = "已手动触发";
-  // 启用状态下顺手把心跳挂起来，这样手动跑完还能自动接着补。
+  // While it is enabled, hang the heartbeat up along the way, so after a manual run it can keep refilling on its own.
   if (p.enabled) startRenewLoop();
   await renewTick();
   return renewStatusSnapshot();
 }
-// 面板「测试」：拉一次之后把每把 key 真验一遍（地区 + 用量接口），一个都不导入。
-// 早先这里还有一个只测链接、不验号的 testRenewLink，但它的结论（通不通、有几个
-// key）已经全在这份结果里，面板上分成两个按钮只是让人多点一次，合并掉了。
+// The panel's "test": after one pull, really validate every key (region plus the usage API), and import none of them.
+// There used to be a testRenewLink here that only tested the link and did not validate accounts, but its conclusions (up or not, how many
+// keys) are all already in this result. Two buttons on the panel only made people click once more, so they were merged.
 async function testRenewAvailability(url) {
   const probe = await renewProbe(url);
   rememberRenewTest(probe.items);
-  // 面板上只显示一行结论，诊断细节落到运行日志里 —— 要对格式、看状态码和耗时的
-  // 时候去那儿查，界面不为这点信息多占一行。
+  // The panel shows only one line of conclusion. Diagnostic detail goes to the run log — when you need the format, the status code, and the timing,
+  // look there. The UI does not spend an extra line on that little information.
   log("号池测试: HTTP " + probe.status
     + (probe.code != null ? " · code " + probe.code : "")
     + " · " + probe.ms + "ms · 提取 " + probe.items.length + " 个 key"
@@ -6093,8 +6220,8 @@ async function testRenewAvailability(url) {
   const existing = renewKnownKeys();
   const rows = [];
   let usable = 0;
-  // 带下标遍历：面板要把「状态正常且可用」的号单独列出来、并且逐个导入，光有掩码
-  // 认不出该收哪一把 —— idx 指向 _renewLastTest.items，导入时凭它取回真实 key。
+  // Iterate with an index: the panel lists accounts that are "healthy and usable" on their own and imports them one by one. A mask alone
+  // cannot tell which one to accept — idx points into _renewLastTest.items, and import uses it to get the real key back.
   for (let idx = 0; idx < probe.items.length; idx++) {
     const it = probe.items[idx];
     const seat = renewItemNote(it);
@@ -6105,7 +6232,7 @@ async function testRenewAvailability(url) {
       });
       continue;
     }
-    // 号池已经标了状态的，不是 active 的直接判掉，不浪费一次验证往返。
+    // If the pool already set a status, one that is not active is rejected directly, and a validation round trip is not wasted.
     if (it.status && it.status !== "active") {
       rows.push({
         idx, masked: maskRenewKey(it.key), dup: false, ok: false, region: it.region || "",
@@ -6123,13 +6250,13 @@ async function testRenewAvailability(url) {
       dup: false,
       ok: v.ok,
       region: v.region || it.region || "",
-      // 额度拆成结构化字段：面板列表照「待导入」那套排版（套餐 · 已用/总量），
-      // 不必再从 note 那串拼好的文本里反解。
+      // Quota is split into structured fields: the panel list is laid out the same way as "pending import" (plan · used/total),
+      // and it does not have to be parsed back out of the string already assembled in note.
       title: (info && info.subscriptionTitle) || "",
       used: hasQuota ? Math.round(info.used || 0) : null,
       total: hasQuota ? Math.round(info.total) : null,
       seat,
-      // 没通过时把原因留在这儿，失败的行仍然要能说清为什么。
+      // When it did not pass, leave the reason here. A failed row still has to be able to say why.
       reason: v.ok ? "" : (v.message || ""),
       note: [
         v.ok
@@ -6154,20 +6281,20 @@ async function testRenewAvailability(url) {
     preview: probe.items.length || probe.msg ? "" : String(probe.body || "").trim().slice(0, 200),
   };
 }
-// 最近一次测试提取到的号，供面板上的「导入这些 Key」用。测试本身从不导入，但看完
-// 结果往往就想直接收下 —— 面板那边只有掩码，没有这份缓存就没法告诉宿主要收哪几把。
+// Accounts extracted by the most recent test, for the panel's "import these keys". The test itself never imports, but after looking at
+// the result you often want to accept them directly — the panel side only has masks, and without this cache it cannot tell the host which ones to accept.
 let _renewLastTest = { items: [], at: 0 };
 function rememberRenewTest(items) {
   _renewLastTest = { items: (items || []).map((it) => ({ ...it })), at: Date.now() };
 }
-// 把最近一次测试里能收的号验一遍再交付（自动导入开着就进密钥列表，关着就进暂存区）。
-// 已存在的、以及号池标了非 active 的直接跳过。
+// Validate the acceptable accounts from the most recent test once more, then deliver them (into the key list if auto-import is on, into the holding area if it is off).
+// Skip ones that already exist, and ones the pool marked as not active.
 async function importRenewTestKeys(indices) {
   if (!_renewLastTest.items.length) {
     throw new Error("请先点「测试」拉一次号");
   }
-  // indices 省略 = 把这一轮能收的全收下（面板上的「全部导入」）；带下标 = 只收
-  // 列表里点的那一行。下标对应 _renewLastTest.items，掩码认不出是哪一把。
+  // Omitting indices means accept every one this round can accept (the panel's "import all"). Passing indexes means accept only
+  // the row that was clicked in the list. The index corresponds to _renewLastTest.items; a mask cannot tell which one it is.
   const picked = Array.isArray(indices) && indices.length
     ? indices
         .map((i) => ({ it: _renewLastTest.items[Number(i)], idx: Number(i) }))
@@ -6178,8 +6305,8 @@ async function importRenewTestKeys(indices) {
   }
   const known = renewKnownKeys();
   const todo = [];
-  // 已经收不了的下标也回报给面板：这一轮后台轮询可能已经把某把号收走了，
-  // 那它就该从「可用号」清单里消失，而不是留着让人反复点、每次都被跳过。
+  // Indexes that can no longer be accepted are reported back to the panel too: a background poll this round may already have accepted some account,
+  // and then it should disappear from the "usable accounts" list, instead of staying there to be clicked over and over and skipped every time.
   const skippedIdx = [];
   for (const one of picked) {
     const { it, idx } = one;
@@ -6191,7 +6318,7 @@ async function importRenewTestKeys(indices) {
     return { imported: 0, stashed: 0, skipped, invalid: 0, doneIdx: [], skippedIdx };
   }
   const good = [];
-  // 真正交付出去的下标回报给面板，收下的行就从可用列表里划掉，剩下的还能接着点。
+  // Indexes that were actually delivered are reported back to the panel, the accepted rows are struck off the usable list, and the rest can still be clicked.
   const doneIdx = [];
   let invalid = 0;
   for (const { it, idx } of todo) {
@@ -6202,8 +6329,8 @@ async function importRenewTestKeys(indices) {
     } else invalid++;
   }
   const d = good.length ? await deliverRenewKeys(good) : { imported: 0, stashed: 0 };
-  // 验证不通过的（invalid）故意不回报下标 —— 有可能只是这一次网络抖动，
-  // 留在清单里还能再点一次，收不上才是真坏。
+  // One that fails validation (invalid) deliberately does not report its index — it may only be network jitter this once,
+  // and leaving it in the list means it can be clicked again. Only failing to accept it means it is really bad.
   return { ...d, skipped, invalid, doneIdx, skippedIdx };
 }
 
@@ -6220,20 +6347,20 @@ function updateStatusBar() {
   const icon = relayMode ? "$(arrow-swap)" : "$(key)";
   statusBarItem.command = "kiroGateway.openPanel";
   statusBarItem.backgroundColor = undefined;
-  // 状态栏带上模式，双模式共存时一眼能看出现在走的是哪条路。
-  statusBarItem.text = icon + " Kiro Gateway: " + (on ? modeLabel() : "未开启");
+  // The status bar carries the mode, so when both modes coexist you can see at a glance which path is in use.
+  statusBarItem.text = icon + " Kiro Gateway: " + (on ? modeLabel() : tr("未开启"));
   if (!on) {
-    statusBarItem.tooltip = "Kiro Gateway 未启用（点击打开面板）"
+    statusBarItem.tooltip = tr("Kiro Gateway 未启用（点击打开面板）"
       + (isEnabled() && !credentialsReady()
         ? relayMode ? " · 中转站地址或 Key 还没填" : " · 还没有可用的 API Key"
-        : "");
+        : ""));
   } else if (relayMode) {
     const snap = relay.relaySnapshot();
-    statusBarItem.tooltip = "中转站模式 · " + snap.baseUrl
-      + (snap.models.count ? " · " + snap.models.count + " 个模型" : "");
+    statusBarItem.tooltip = tr("中转站模式 · " + snap.baseUrl
+      + (snap.models.count ? " · " + snap.models.count + " 个模型" : ""));
   } else {
-    statusBarItem.tooltip = "APIKEY 直连 · region=" + getRegion()
-      + (isRegionAuto() ? "（自动识别）" : "") + " · " + maskKey(getApiKey());
+    statusBarItem.tooltip = tr("APIKEY 直连 · region=" + getRegion()
+      + (isRegionAuto() ? "（自动识别）" : "") + " · " + maskKey(getApiKey()));
   }
   statusBarItem.show();
 }
@@ -6249,7 +6376,7 @@ function applyState(opts = {}) {
   _applyChain = _applyChain.then(run, run);
   return _applyChain;
 }
-// 上一次绑定服务器时用的模式。模式一变就必须重建监听器 —— 端口和处理器都换了。
+// The mode used the last time the server was bound. A mode change must rebuild the listeners — both the port and the handler have changed.
 let _boundMode = "";
 async function _applyStateImpl(opts = {}) {
   const mode = getMode();
@@ -6278,40 +6405,50 @@ async function _applyStateImpl(opts = {}) {
     if (cpsServer) { cpsServer.stop(); cpsServer = null; log("[CPS] stopped (disabled)"); }
     _boundMode = "";
     // Nothing can still be in flight once the listener is gone; make sure the
-    // live "进行中" indicator can't stay stuck.
+    // live "in progress" indicator can't stay stuck.
     if (_statsInflight !== 0) { _statsInflight = 0; pushStatsNow(); }
   }
   const { bound, changed } = await syncEndpoints();
-  // 后台账号巡检跟着开关 / 模式 / 密钥数量走：网关没开或切到中转站就停掉，不做
-  // 无意义的探测。
+  // The background account sweep follows the switch, the mode, and the key count: stop it when the gateway is off or switched to relay, and do no
+  // pointless probing.
   syncHealthSweep();
-  // 推理平面真探活也跟着走。它比巡检重（每次消耗一次生成请求），所以默认关闭，
-  // 只有用户显式打开 livenessCheckEnabled 才跑。
+  // The inference-plane real liveness probe follows too. It is heavier than the sweep (each one consumes a generate request), so it is off by default,
+  // and it runs only when the user explicitly turns on livenessCheckEnabled.
   syncLivenessScheduler();
   updateStatusBar();
   if (changed && !opts.silent) {
+    const confirm = tr("重新加载窗口");
     const pick = await vscode.window.showInformationMessage(
-      "Kiro Gateway 已接管内置对话。需要重新加载窗口后 Kiro 才会走新端点。",
-      "重新加载窗口"
+      tr("Kiro Gateway 已接管内置对话。需要重新加载窗口后 Kiro 才会走新端点。"),
+      confirm
     );
-    if (pick === "重新加载窗口") await vscode.commands.executeCommand("workbench.action.reloadWindow");
+    if (pick === confirm) await vscode.commands.executeCommand("workbench.action.reloadWindow");
   }
   return { bound, changed };
 }
 
-// 切换工作模式。两种模式端口不同，端点重定向必须跟着改，所以切完要重载窗口才
-// 真正生效 —— Kiro 只在启动时读一次端点配置。
+// Switch the working mode. The two modes use different ports, and the endpoint redirect has to change with them, so a window reload is required after the switch before it
+// really takes effect — Kiro reads the endpoint config only once, at startup.
 async function switchModeTo(mode) {
-  const next = await setMode(mode);
-  // 上一个站点的模型列表 / 用量缓存作废，免得切回来看到的是旧数据。
+  const next = mode === MODE_RELAY ? MODE_RELAY : MODE_OFFICIAL;
+  if (next === getMode()) return getMode();
+  const current = modeLabel();
+  const target = tr(MODE_LABEL[next] || next);
+  const confirm = tr("切换并重新加载");
+  const pick = await vscode.window.showInformationMessage(
+    uiLocale() === "en"
+      ? "The route that is running (" + current + ") will stop. Reload the window before Kiro uses " + target + "."
+      : "正在跑的线路（" + current + "）会停掉。重新加载窗口后 Kiro 才会走「" + target + "」。",
+    { modal: true },
+    confirm
+  );
+  if (pick !== confirm) return getMode();
+  await setMode(next);
+  // Drop the previous site's model list and usage cache.
   relay.invalidateRelayCaches();
   await applyState({ silent: true });
   panelProvider && panelProvider.pushState();
-  const pick = await vscode.window.showInformationMessage(
-    "已切换到「" + (MODE_LABEL[next] || next) + "」。需要重新加载窗口后 Kiro 才会走新端点。",
-    "重新加载窗口"
-  );
-  if (pick === "重新加载窗口") await vscode.commands.executeCommand("workbench.action.reloadWindow");
+  await vscode.commands.executeCommand("workbench.action.reloadWindow");
   return next;
 }
 
@@ -6322,9 +6459,9 @@ class ControlPanelProvider {
   constructor() { this.view = null; }
   resolveWebviewView(webviewView) {
     this.view = webviewView;
-    const distRoot = vscode.Uri.joinPath(extContext.extensionUri, "webview-ui", "dist");
-    webviewView.webview.options = { enableScripts: true, localResourceRoots: [distRoot] };
-    webviewView.webview.html = this.getHtml(webviewView.webview, distRoot);
+    this.distRoot = vscode.Uri.joinPath(extContext.extensionUri, "webview-ui", "dist");
+    webviewView.webview.options = { enableScripts: true, localResourceRoots: [this.distRoot] };
+    webviewView.webview.html = this.getHtml(webviewView.webview, this.distRoot);
     webviewView.webview.onDidReceiveMessage(async (msg) => {
       try { await this.onMessage(msg); } catch (e) { this.post({ type: "error", message: e?.message || String(e) }); }
     });
@@ -6335,6 +6472,13 @@ class ControlPanelProvider {
     // The webview is disposed whenever the panel is hidden, and stats pushes
     // fire from background traffic, so posting can hit a dead view. Swallow it
     // instead of throwing out of a timer.
+    if (m && typeof m === "object") {
+      if ((m.type === "toast" || m.type === "error") && typeof m.message === "string") {
+        m = Object.assign({}, m, { message: tr(m.message) });
+      } else if (m.type === "needReload" && typeof m.text === "string") {
+        m = Object.assign({}, m, { text: tr(m.text) });
+      }
+    }
     try { this.view.webview.postMessage(m); } catch {}
   }
   pushState() {
@@ -6344,8 +6488,8 @@ class ControlPanelProvider {
     this.post({
       type: "state",
       enabled: isEnabled(),
-      // region 是这把号实际会走的区域：自动模式下用它自己探测到的那个，探过才有
-      // 值，没探过就落到全局配置。面板按号显示，不再让用户手选。
+      // region is the region this account will actually use: in automatic mode, the one it detected for itself. It has a
+      // value only after it has been probed; otherwise it falls through to the global config. The panel shows it per account, and the user no longer picks it by hand.
       keys: keys.map((k, i) => ({
         index: i,
         masked: maskKeyLong(k),
@@ -6361,7 +6505,7 @@ class ControlPanelProvider {
       regionDetecting: isRegionDetecting(),
       regionCandidates: REGION_CANDIDATES,
       ports: getPorts(),
-      // 双模式：mode 决定面板显示哪一套配置，relay* 是中转站那一侧的全部状态。
+      // Two modes: mode decides which set of config the panel shows, and relay* is the whole state on the relay side.
       mode: getMode(),
       relayPorts: getRelayPorts(),
       relay: { ...relayPrefs(), ...relay.relaySnapshot() },
@@ -6372,7 +6516,7 @@ class ControlPanelProvider {
       prompts: getPromptPrefs(),
       autoSwitch: getSwitchPrefs(),
       retry: getRetryPrefs(),
-      // 生成端点链与限流处置策略。面板只读展示，改动走 settings.json 或命令面板。
+      // The generate-endpoint chain and the throttle-handling policy. The panel shows them read-only; changes go through settings.json or the command palette.
       endpoints: {
         list: GEN_ENDPOINTS.map((e) => ({ id: e.id, label: e.label, base: e.base(getRegion()) })),
         preferred: getPreferredEndpointId(),
@@ -6382,15 +6526,15 @@ class ControlPanelProvider {
         patience: getThrottlePatience(),
         serverErrorRetry: getServerErrorRetryPrefs(),
       },
-      // 探活 + 号变废自动删的开关与上一轮结果。
+      // The switches for the liveness probe and for automatic deletion of a dead account, plus the result of the last round.
       liveness: livenessStateSnapshot(),
-      // Agent 命令确认弹窗自动放行。
+      // Automatically approve the Agent command-confirmation dialog.
       autoAllow: autoAllowEnabled(),
       autoRenew: getRenewPrefs(),
-      // 待导入暂存区：「自动导入」关掉时新号先落这里，等用户在面板上确认。
+      // Pending-import holding area: when "auto import" is off, a new account lands here first and waits for the user to confirm it on the panel.
       renewPending: renewPendingSnapshot(),
-      // 网关实际跑没跑起来。开关开着不等于端口就是自己的 —— 多窗口时很可能是
-      // 隔壁窗口在转发，顶栏要把这件事说清楚。
+      // Whether the gateway is actually up and running. The switch being on does not mean the port is ours — with multiple windows it is often
+      // the window next door doing the forwarding, and the top bar has to say so.
       gateway: gatewayRuntimeState(),
       gatewayPlanes: gatewayPlaneStates(),
       version: currentVersion(),
@@ -6398,8 +6542,8 @@ class ControlPanelProvider {
     });
     this.pushStats();
   }
-  // 面板「统计」卡片用的实时计数。顺带把处于冷却中的密钥一起送过去：面板每几秒
-  // 拉一次，冷却剩余时间因此能自己走。
+  // Live counters for the panel's "stats" card. Keys that are cooling down are sent along: the panel pulls every few seconds,
+  // so the remaining cooldown can tick on its own.
   pushStats() {
     this.post({
       type: "stats",
@@ -6407,10 +6551,10 @@ class ControlPanelProvider {
       keyStats: keyStatsSnapshot(),
       cooldowns: cooldownSnapshot(),
       keyStatus: keyStatusSnapshot(),
-      // 自动续号的运行状态跟着统计一起走：面板每几秒拉一次，倒计时自己会动。
+      // The automatic-refill runtime state travels with the stats: the panel pulls every few seconds, and the countdown moves on its own.
       renew: renewStatusSnapshot(),
-      // 端点冷却剩余时间、探活上一轮结果、已探明的能力缺失，都是会动的量，跟着
-      // 统计一起推，面板不用自己算。
+      // Remaining endpoint cooldown, the last liveness-round result, and capability gaps already discovered are all moving quantities. They are pushed
+      // along with the stats, and the panel does not have to compute them itself.
       endpointStatus: endpointStatusSnapshot(),
       liveness: livenessStateSnapshot(),
       endpointUnsupported: unsupportedSnapshot(),
@@ -6423,19 +6567,19 @@ class ControlPanelProvider {
   //
   // opts.retries / opts.retryDelayMs: a freshly-created ksk_ key often isn't
   // queryable on the backend for the first second or two, so the immediate
-  // post-add sync can fail even though the key is valid (a manual "立即同步"
+  // post-add sync can fail even though the key is valid (a manual "sync now"
   // a moment later succeeds). Retrying a few times papers over that window so
-  // the new key doesn't render a stale "同步失败".
+  // the new key doesn't render a stale "sync failed".
   async syncAccounts(targets, opts = {}) {
     const { retries = 0, retryDelayMs = 1500, force = false } = opts;
     const keys = getApiKeys();
     let valid = targets.filter((idx) => idx >= 0 && idx < keys.length);
-    // 已失效 / 已禁用 / 额度用尽是终态：不再重复探测，省掉一次往返，状态也不会
-    // 被网络抖动改写。这些行继续显示上一次拿到的套餐和积分。只有用户在某一行
-    // 手动点「同步账户信息」（force）才会再查一次，作为人工复核的出口。
+    // Invalid, suspended, and quota exhausted are terminal: do not probe them again, which saves a round trip, and the state will not
+    // be overwritten by network jitter. Those rows keep showing the plan and credits from last time. Only when the user, on some row,
+    // clicks "sync account info" by hand (force) is it queried again, as the exit for a manual review.
     if (!force) valid = valid.filter((idx) => !keyHealthFrozen(keys[idx]));
-    // 过滤后可能一个都不剩，这时也要补一条 accountDone，否则面板的「同步中…」
-    // 会一直转。
+    // After filtering, none may be left. An accountDone still has to be sent then, or the panel's "syncing…"
+    // spins forever.
     if (!valid.length) { this.post({ type: "accountDone", at: Date.now() }); return; }
     // Query keys in small concurrent batches instead of all at once: syncing
     // dozens/hundreds of keys with a single Promise.all would fire that many
@@ -6446,13 +6590,13 @@ class ControlPanelProvider {
     const BATCH_SIZE = 5;
     const syncOne = async (idx) => {
       let lastErr;
-      // 面板这一次探测也记进"上次探测时间"，宿主端的后台巡检就不会紧接着再打
-      // 同一把号一遍。
+      // This probe from the panel is also recorded in "last probe time", so the host's background sweep does not hit
+      // the same account once more right after.
       noteKeyProbed(keys[idx]);
       for (let attempt = 0; attempt <= retries; attempt++) {
         try {
           const info = await fetchAccountInfo(keys[idx]);
-          // 同步结果同时用来判定账号状态（正常 / 额度用尽 / 已失效）。
+          // The sync result is also used to judge account state (healthy / quota exhausted / invalid).
           noteAccountHealth(keys[idx], true, info);
           // Include the key string so the webview can cache by key identity
           // (stable across reorders) instead of a volatile array index.
@@ -6464,7 +6608,7 @@ class ControlPanelProvider {
         }
       }
       const failMsg = lastErr?.message || String(lastErr);
-      // 整个错误对象交过去：里面带着 HTTP 状态码和响应体，判定才有硬依据。
+      // Hand over the whole error object: it carries the HTTP status code and the response body, which is the hard basis for the judgment.
       noteAccountHealth(keys[idx], false, null, lastErr);
       this.post({ type: "accountResult", index: idx, key: panelFullKey(keys[idx]), ok: false, message: failMsg });
     };
@@ -6479,8 +6623,8 @@ class ControlPanelProvider {
       case "ready":
         this.pushState();
         break;
-      // --- 生成端点 / 探活 / 自动放行 -------------------------------------
-      // 端点参数改动会影响下一次转发走哪个主机，改完顺手把生效的链打进日志。
+      // --- Generate endpoints / liveness / auto-approve -------------------------------------
+      // An endpoint-parameter change affects which host the next forward uses. After the change, log the chain that is in effect.
       case "setEndpointPrefs": {
         const p = msg.prefs || {};
         if (typeof p.preferred === "string" && GEN_ENDPOINTS.some((e) => e.id === p.preferred)) {
@@ -6498,8 +6642,8 @@ class ControlPanelProvider {
         this.pushState();
         break;
       }
-      // 端点冷却和能力缺失都只在内存里，清掉相当于"忘掉刚才那几次失败"，
-      // 下一次请求重新从首选端点起步。
+      // Endpoint cooldowns and capability gaps live only in memory. Clearing them is "forget those last few failures",
+      // and the next request starts again from the preferred endpoint.
       case "resetEndpointState": {
         for (const e of GEN_ENDPOINTS) endpointClearCooldown(e.id);
         resetEndpointUnsupported();
@@ -6525,21 +6669,27 @@ class ControlPanelProvider {
       }
       case "setAutoAllow": {
         await set("autoAllow.enabled", !!msg.value);
-        // 配置监听里也会同步一次，这里显式调用是为了面板点完立刻生效，不等事件。
+        // The config listener syncs once too. The explicit call here is so a click on the panel takes effect immediately, without waiting for the event.
         syncAutoAllow("面板");
         this.pushState();
         break;
       }
-      // --- 双模式与中转站 -----------------------------------------------
+      // --- Two modes and the relay -----------------------------------------------
       case "setMode": {
         const next = msg.mode === MODE_RELAY ? MODE_RELAY : MODE_OFFICIAL;
         if (next === getMode()) break;
         await switchModeTo(next);
         break;
       }
+      case "setLanguage": {
+        const next = msg.value === "en" ? "en" : "zh";
+        if (get("language", "auto") === next) break;
+        await set("language", next);
+        break;
+      }
       case "setRelay": {
-        // 面板一次提交整份草稿：地址、Key 和各项翻译参数一起落盘，避免逐项写配置
-        // 时被中间态触发多次 applyState。
+        // The panel submits the whole draft at once: address, Key, and the translation parameters are persisted together, so writing config item by item
+        // does not let an intermediate state fire applyState several times.
         const patch = msg.patch && typeof msg.patch === "object" ? msg.patch : {};
         const FIELDS = {
           baseUrl: "relayBaseUrl",
@@ -6565,7 +6715,7 @@ class ControlPanelProvider {
           await set(confKey, v);
         }
         if (credsChanged) relay.invalidateRelayCaches();
-        // 中转站模式下改地址/Key 会让「凭证齐了没有」的结论变化，要重新接管端点。
+        // In relay mode, changing the address or the Key changes the "are the credentials complete" conclusion, and the endpoints have to be taken over again.
         if (isRelayMode()) await applyState({ silent: true });
         this.pushState();
         this.post({ type: "toast", message: "中转站配置已保存" });
@@ -6725,7 +6875,7 @@ class ControlPanelProvider {
         if (i >= 0 && i < list.length) {
           const [gone] = list.splice(i, 1);
           await setApiKeys(list);
-          // 删掉就把它的状态判定一起丢掉，别让终态留在落盘里。
+          // On delete, throw away its state judgment too, so a terminal state is not left in what was persisted.
           forgetKeyHealth(gone);
           await set("enabled", false);
           await applyState({ silent: true });
@@ -6744,15 +6894,15 @@ class ControlPanelProvider {
         const i = Number(msg.index);
         if (i >= 0 && i < list.length) {
           await set("activeApiKey", list[i]);
-          // silent: 切换密钥不动端口也不动启用状态，本地端点不会变，用不着催重载。
+          // silent: switching keys does not touch the port or the enabled state. The local endpoint does not change, so there is no need to urge a reload.
           await applyState({ silent: true });
-          // 换了密钥就顺带把地区对齐到这把密钥所属的区域：缓存命中是零开销，
-          // 没缓存才探一次（两个候选并发，通常不到一秒）。
+          // After the key changes, line the region up with the region this key belongs to: a cache hit costs nothing,
+          // and only a miss probes once (the two candidates concurrently, usually under a second).
           await ensureRegionDetected({ silent: true });
           this.pushState();
-          // 代理每次转发都实时读取当前密钥，所以手动切换和自动切号一样立即生效 ——
-          // 后者走的就是同一条路径（adoptKey），从来不提示重载。早先这里弹「需要
-          // 重新加载窗口」是历史遗留，白让用户多点一次，改成一个 toast 就够了。
+          // The proxy reads the current key live on every forward, so a manual switch takes effect immediately, the same as an automatic switch —
+          // the latter goes through the same path (adoptKey) and never prompts a reload. The "reload the window" dialog that used to pop here was a leftover,
+          // an extra click for the user for nothing. A toast is enough.
           this.post({ type: "toast", message: "已切换密钥，立即生效" });
         }
         break;
@@ -6810,7 +6960,7 @@ class ControlPanelProvider {
         break;
       }
       case "saveRegion": {
-        // value === "__auto" → 交给自动识别；其余值 → 固定用户选的地区。
+        // value === "__auto" → leave it to auto-detection; any other value → fix the region the user picked.
         const raw = String(msg.value || "").trim();
         if (raw === "__auto") {
           await setRegionAutoPref(true);
@@ -6828,7 +6978,7 @@ class ControlPanelProvider {
         break;
       }
       case "detectRegion": {
-        // 面板上的「重新识别」：忽略缓存重新探测，并把结果反馈给用户。
+        // "Detect again" on the panel: ignore the cache, probe again, and report the result back to the user.
         if (!getApiKey()) {
           this.post({ type: "error", message: "请先添加 API Key 再识别地区" });
           break;
@@ -6840,13 +6990,13 @@ class ControlPanelProvider {
       }
       case "toggle":
         await set("enabled", !!msg.value);
-        // silent: 面板顶部会自己点亮一条重载提示（不是模态框，不打断操作），
-        // 这里压掉 VS Code 原生对话框，免得同一件事提示两遍。
+        // silent: the top of the panel lights up its own reload hint (not a modal, and it does not interrupt the work),
+        // and the native VS Code dialog is suppressed here, so the same thing is not prompted twice.
         await applyState({ silent: true });
         this.pushState();
-        // 文案要说清「开关本身已经生效了」：端口、状态栏、面板当场就跟着变，
-        // 重载只是让 Kiro 自带对话换端点。不然用户看到「需要重新加载」会以为
-        // 刚才那一下没生效，白等在那儿。
+        // The copy has to make clear that "the switch itself has already taken effect": the port, the status bar, and the panel change on the spot,
+        // and the reload only makes Kiro's built-in chat switch endpoints. Otherwise a user who sees "reload required" thinks
+        // the click just now did not take effect, and waits there for nothing.
         this.post({
           type: "needReload",
           text: msg.value
@@ -6861,12 +7011,12 @@ class ControlPanelProvider {
         this.post({ type: "testing", index: i });
         try {
           const r = await testKey(key);
-          // 测试通过也是一次真实探测，用来刷新账号状态。
+          // A passed test is also one real probe, and it is used to refresh account state.
           noteAccountHealth(key, true, { used: r.used, total: r.total });
           this.post({ type: "testResult", index: i, ok: true, result: r });
         } catch (e) {
           const msg = e?.message || String(e);
-          // 传错误对象而不是字符串：状态码在对象上，判定要靠它。
+          // Pass the error object, not a string: the status code is on the object, and the judgment depends on it.
           noteAccountHealth(key, false, null, e);
           this.post({ type: "testResult", index: i, ok: false, message: msg });
         }
@@ -6892,8 +7042,8 @@ class ControlPanelProvider {
         if (typeof msg.enabled === "boolean") await setPref("autoSwitch", msg.enabled);
         if (typeof msg.loadBalance === "boolean") {
           await setPref("loadBalance", msg.loadBalance);
-          // 刚关掉均衡的话，当前选中的那把可能是上一轮轮转留下的。它自己还正常就
-          // 继续用（用户看到的就是它），不正常才让 maybeAdoptUsableKey 换一把。
+          // If balancing was just turned off, the currently selected one may be left over from the last round of rotation. If it is still healthy,
+          // keep using it (it is the one the user sees). Only if it is not healthy does maybeAdoptUsableKey switch to another.
           if (!msg.loadBalance) maybeAdoptUsableKey();
         }
         if (msg.cooldownMs != null) {
@@ -6906,10 +7056,10 @@ class ControlPanelProvider {
         break;
       }
       case "setRenew": {
-        // 面板「保存配置」一次性提交整份配置，宿主再夹一遍取值区间。
+        // The panel's "save config" submits the whole config at once, and the host clamps the ranges once more.
         await setRenewPrefs(msg.patch || {});
-        // 参数变了就把这次触发的节奏计数复位：新的间隔 / 阈值应该立刻生效，
-        // 而不是等旧的退避走完。
+        // If a parameter changed, reset this trigger's cadence counters: the new interval and threshold should take effect immediately,
+        // instead of waiting for the old backoff to finish.
         resetRenewCounters();
         syncRenewLoop();
         this.pushState();
@@ -6917,7 +7067,7 @@ class ControlPanelProvider {
         break;
       }
       case "testRenewKeys": {
-        // 面板上就一个「测试」按钮：拉一次链接，再把拿到的号逐个验一遍。
+        // There is only one "test" button on the panel: pull the link once, then validate the accounts that came back, one by one.
         this.post({ type: "renewTesting", mode: "keys" });
         try {
           const result = await testRenewAvailability(msg.url);
@@ -6938,7 +7088,7 @@ class ControlPanelProvider {
         break;
       }
       case "renewReset":
-        // 停手 / 熔断之后的翻案出口：计数清零，心跳会立刻重新判断要不要补号。
+        // The exit that reverses a stop or an open circuit: zero the counters, and the heartbeat immediately rejudges whether to refill.
         resetRenewCounters();
         _renew.lastMessage = "已重置续号计数";
         syncRenewLoop();
@@ -6946,7 +7096,7 @@ class ControlPanelProvider {
         this.post({ type: "toast", message: "已重置续号计数" });
         break;
       case "importPending": {
-        // keys 为空 = 全部导入。
+        // An empty keys means import all of them.
         const n = await importPendingKeys(msg.keys);
         this.pushStats();
         if (n > 0) this.post({ type: "toast", message: "已导入 " + n + " 个新 key" });
@@ -6960,8 +7110,8 @@ class ControlPanelProvider {
         break;
       }
       case "importTestKeys": {
-        // 可用号列表上的导入：indices 省略 = 全部导入，带下标 = 只收那一行。
-        // 验一遍再按「自动导入」的设置交付。
+        // Import from the usable-account list: omitting indices means import all, and passing an index means accept only that row.
+        // Validate once more, then deliver according to the "auto import" setting.
         this.post({ type: "renewTesting", mode: "import", indices: msg.indices });
         try {
           const r = await importRenewTestKeys(msg.indices);
@@ -6974,7 +7124,7 @@ class ControlPanelProvider {
             type: "renewTestResult",
             mode: "import",
             ok: r.imported > 0 || r.stashed > 0,
-            // 收下的下标带回去，面板把对应行从可用列表里划掉，剩下的还能接着点。
+            // The accepted indexes are sent back, the panel strikes the matching rows off the usable list, and the rest can still be clicked.
             doneIdx: r.doneIdx || [],
             message: parts.length ? parts.join("，") : "没有可导入的新 key",
           });
@@ -6985,12 +7135,12 @@ class ControlPanelProvider {
         break;
       }
       case "clearCooldowns":
-        // 连同"失效 / 额度用尽 / 已禁用"的判定一起清掉（含落盘的那份），让所有
-        // 密钥重新回到未检测状态，下一次请求或同步会重新给出结论。额度用尽的号
-        // 到了新周期要恢复，就从这里翻案。
+        // Clear the "invalid / quota exhausted / suspended" judgments along with it (including the persisted copy), and send every
+        // key back to the not-checked state. The next request or sync produces a fresh conclusion. An account whose quota is exhausted
+        // is reversed from here when a new cycle arrives and it should recover.
         resetKeyHealth();
-        // 地区识别缓存跟着一起清：下一次同步或转发会重新识别，订阅换了区域也能
-        // 从这里翻案。
+        // Clear the region-detection cache along with it: the next sync or forward detects again, and a subscription that changed region can
+        // be reversed from here too.
         await forgetRegionCache();
         this.pushStats();
         this.post({ type: "toast", message: "已重置全部账号状态" });
@@ -7020,9 +7170,9 @@ class ControlPanelProvider {
           const i = Number(msg.index);
           targets = i >= 0 && i < keys.length ? [i] : keys.map((_, idx) => idx);
         }
-        // force 只由某一行右键的「同步账户信息」带上：那是用户点着某个号要复核，
-        // 连已经冻结的终态也重查一次。定时刷新和「立即同步」都不 force，终态
-        // 因此不会被反复探测。
+        // force is carried only by "sync account info" on a row's right-click menu: the user is pointing at some account and asking for a review,
+        // and even a frozen terminal state is queried again. Timed refresh and "sync now" do not pass force, so a terminal state
+        // is not probed over and over.
         await this.syncAccounts(targets, { force: msg.force === true });
         break;
       }
@@ -7080,28 +7230,33 @@ class ControlPanelProvider {
       + "style-src " + webview.cspSource + " 'unsafe-inline'; "
       + "font-src " + webview.cspSource + " data:; "
       + "script-src " + webview.cspSource + " 'unsafe-inline' 'unsafe-eval';\">";
-    html = html.replace(/<head>/i, "<head>\n    " + csp);
+    const boot = "<script>globalThis.__KK_LANG=" + JSON.stringify(uiLocale()) + ";</script>";
+    html = html.replace(/<head>/i, "<head>\n    " + boot + "\n    " + csp);
     return html;
+  }
+  refreshHtml() {
+    if (!this.view || !this.distRoot) return;
+    this.view.webview.html = this.getHtml(this.view.webview, this.distRoot);
   }
 }
 
 // ---------------------------------------------------------------------------
-// Agent 命令确认弹窗（Allow）自动放行
+// Automatically approve the Agent command-confirmation dialog (Allow)
 // ---------------------------------------------------------------------------
-// Kiro 的 Trust v2 从 ~/.kiro/settings/permissions.yaml 读规则，PolicySession
-// 监听该文件，改动后自动重建，不需要重载窗口。
+// Kiro's Trust v2 reads rules from ~/.kiro/settings/permissions.yaml. PolicySession
+// watches that file and rebuilds automatically after a change, with no need to reload the window.
 //
-// 写进去的规则就是 Kiro 内置 "allow-all" 预设的规则体本身：
+// The rule written in is the rule body of Kiro's built-in "allow-all" preset itself:
 //   { capability: "all", effect: "allow" }
-// capability 的合法取值是分组 all / builtin / filesystem / sandbox_network 加十来个
-// 单项；all = builtin + mcp，所以一条就覆盖 shell、文件读写、MCP、web 全部。
+// The legal values of capability are the groups all / builtin / filesystem / sandbox_network plus a dozen or so
+// individual items. all = builtin + mcp, so one rule covers shell, file read and write, MCP, and web, all of it.
 //
-// 有六个内置强制询问项【改这个文件无效】，因为 Trust v2 的裁决顺序是
-// deny > ask > allow，而这些规则由 kiro-agent 无条件注入（source: "kiro-scope"）：
+// There are six built-in forced-ask items [editing this file has no effect], because Trust v2's decision order is
+// deny > ask > allow, and these rules are injected unconditionally by kiro-agent (source: "kiro-scope"):
 //   .git  .vscode  .kiro/agents/**  .kiro/hooks/**  **/*.code-workspace  **/mcp.json
-// 另有一条硬 deny：Agent 工具不允许写 ~/.kiro/settings/ 与 .kiro/settings/。
-// 注意那条 deny 管的是 Agent 的 fs_write 工具，插件自己用 Node fs 直接写不经过
-// 策略引擎，所以下面的写入是可行的。
+// There is also one hard deny: the Agent tool is not allowed to write ~/.kiro/settings/ or .kiro/settings/.
+// Note that this deny governs the Agent's fs_write tool. The extension writes with Node fs directly and does not go through
+// the policy engine, so the write below is possible.
 const AUTO_ALLOW_MARKER = "# kiro-gateway:auto-allow";
 const AUTO_ALLOW_MARKER_LINE =
   AUTO_ALLOW_MARKER + "  由插件维护：关掉 autoAllow.enabled 会自动删除下面这条规则";
@@ -7110,9 +7265,9 @@ const AUTO_ALLOW_HEADER = [
   "# 本文件由 Kiro Gateway 创建。删掉整个文件即可恢复 Kiro 默认的逐项确认。",
 ];
 
-// 极简 YAML 扫描器。只认「顶层 rules: 下面一层的列表项」这一种结构，够用来判断
-// 有没有 all/allow 规则以及定位插件自己写的那一段。故意不引第三方 YAML 依赖：
-// vsix 必须自包含，加依赖就得打包 node_modules。
+// A minimal YAML scanner. It only recognizes one structure, "list items one level under the top-level rules:", which is enough to tell
+// whether there is an all/allow rule and to locate the section the extension itself wrote. A third-party YAML dependency is deliberately not pulled in:
+// a vsix has to be self-contained, and adding a dependency means bundling node_modules.
 function parseRuleItems(text) {
   const lines = String(text == null ? "" : text).split(/\r?\n/);
   const items = [];
@@ -7128,7 +7283,7 @@ function parseRuleItems(text) {
       if (/^rules\s*:\s*$/.test(line)) inRules = true;
       continue;
     }
-    // 回到顶层的另一个键，说明 rules 段结束了
+    // Back at another top-level key, which means the rules section has ended
     if (indent === 0) { push(); break; }
     const dash = line.match(/^(\s*)-\s*(.*)$/);
     if (dash && (dashIndent < 0 || dash[1].length === dashIndent)) {
@@ -7153,7 +7308,7 @@ function unquote(v) {
   return String(v == null ? "" : v).trim().replace(/^["']|["']$/g, "");
 }
 
-// 已经有等价的全放行规则了吗（不管是谁写的）。
+// Is there already an equivalent allow-all rule (no matter who wrote it).
 function hasAllowAllRule(text) {
   return parseRuleItems(text).some(
     (it) => unquote(it.keys.capability) === "all" && unquote(it.keys.effect) === "allow"
@@ -7166,7 +7321,7 @@ function findRulesKeyLine(text) {
   return -1;
 }
 
-// 沿用文件里已有列表项的缩进，避免混用两种缩进把 YAML 弄坏。
+// Reuse the indentation of the list items already in the file, so mixing two indent styles does not break the YAML.
 function ruleItemIndent(text) {
   const items = parseRuleItems(text);
   return items.length > 0 ? items[0].indent : 2;
@@ -7185,36 +7340,36 @@ function freshPermissionsText() {
   return AUTO_ALLOW_HEADER.concat(["", "rules:"], buildAutoAllowLines(2), [""]).join("\n");
 }
 
-// text -> { text, changed, reason }。纯函数，不碰磁盘。
-// reason 取值：created / inserted / already-allowed / no-rules-key
+// text -> { text, changed, reason }. A pure function; it does not touch the disk.
+// reason is one of: created / inserted / already-allowed / no-rules-key
 function addAutoAllowRule(text) {
   const raw = String(text == null ? "" : text);
   const meaningful = raw.split(/\r?\n/).some((l) => l.trim() !== "" && !/^\s*#/.test(l));
   if (!meaningful) return { text: freshPermissionsText(), changed: true, reason: "created" };
   if (hasAllowAllRule(raw)) return { text: raw, changed: false, reason: "already-allowed" };
   const at = findRulesKeyLine(raw);
-  // 没有 rules: 顶层键就不猜结构 —— 宁可什么都不做，也不要写坏用户的文件。
+  // There is no top-level rules: key, so do not guess the structure — better to do nothing than to corrupt the user's file.
   if (at < 0) return { text: raw, changed: false, reason: "no-rules-key" };
   const lines = raw.split(/\r?\n/);
   lines.splice(at + 1, 0, ...buildAutoAllowLines(ruleItemIndent(raw)));
   return { text: lines.join("\n"), changed: true, reason: "inserted" };
 }
 
-// 只删插件自己写的那一段（靠标记行定位），用户手写的同类规则一律不动。
-// reason 取值：removed / absent
+// Delete only the section the extension itself wrote (located by the marker line). Leave rules of the same kind that the user wrote by hand untouched.
+// reason is one of: removed / absent
 function removeAutoAllowRule(text) {
   const raw = String(text == null ? "" : text);
   const lines = raw.split(/\r?\n/);
   const at = lines.findIndex((l) => l.includes(AUTO_ALLOW_MARKER));
   if (at < 0) return { text: raw, changed: false, reason: "absent" };
-  let end = at; // 含标记行
+  let end = at; // including the marker line
   let i = at + 1;
   while (i < lines.length && lines[i].trim() === "") i++;
   const dash = i < lines.length ? lines[i].match(/^(\s*)-\s*(.*)$/) : null;
   if (dash) {
     const dashIndent = dash[1].length;
     end = i;
-    // 跟着的、缩进更深的行属于同一个列表项
+    // A following line that is indented deeper belongs to the same list item
     for (let j = i + 1; j < lines.length; j++) {
       const l = lines[j];
       if (l.trim() === "") break;
@@ -7240,8 +7395,8 @@ function permissionsJsonPath() {
   return path.join(kiroSettingsDir(), "permissions.json");
 }
 
-// 原子写 + 首次备份，与 writeEndpointToSettingsFile 的做法保持一致。
-// 编码固定 UTF-8 无 BOM：Node 的 "utf8" 不写 BOM，中文注释才不会被解析器拒掉。
+// Atomic write plus a first-time backup, the same approach as writeEndpointToSettingsFile.
+// Encoding is fixed as UTF-8 with no BOM: Node's "utf8" writes no BOM, so a Chinese comment is not rejected by the parser.
 function writePermissionsFile(file, text) {
   fsMod.mkdirSync(path.dirname(file), { recursive: true });
   const backup = file + ".kiro-gateway.bak";
@@ -7258,15 +7413,15 @@ function writePermissionsFile(file, text) {
   }
 }
 
-// 幂等：已经放行就什么都不写。开关关掉时只回收插件自己加的那一段。
+// Idempotent: if it is already allowed, write nothing. When the switch is turned off, take back only the section the extension itself added.
 function syncAutoAllow(why) {
   const on = autoAllowEnabled();
   const file = permissionsYamlPath();
   const tag = "auto-allow" + (why ? " (" + why + ")" : "");
   try {
     const exists = fsMod.existsSync(file);
-    // Trust v2 认 permissions.yaml 和 permissions.json 两种格式，YAML 优先。
-    // 只有 json 时新建 yaml 会让用户原有的 json 规则被整份忽略，这种情况不动手。
+    // Trust v2 recognizes both permissions.yaml and permissions.json, and YAML takes priority.
+    // When only json exists, creating a yaml would make the user's existing json rules be ignored as a whole. Do not touch it in that case.
     if (on && !exists && fsMod.existsSync(permissionsJsonPath())) {
       log("!! " + tag + ": 检测到 permissions.json 而没有 permissions.yaml。"
         + "新建 yaml 会让 json 里的规则全部失效（Trust v2 优先读 yaml），已跳过。"
@@ -7304,18 +7459,18 @@ function syncAutoAllow(why) {
 async function activate(context) {
   extContext = context;
   loadStats();
-  // 恢复已失效 / 额度用尽 / 已禁用的判定：这些号重载窗口后也不该被重新探测。
+  // Restore the judgments for invalid / quota exhausted / suspended: these accounts should not be probed again after a window reload either.
   loadKeyHealth();
-  // 上次拉到但还没确认导入的新号，重载窗口后接着等确认。
+  // New accounts that were pulled last time but not yet confirmed for import keep waiting for confirmation after a window reload.
   loadRenewPending();
-  // 只保留当天数据：加载时先按日期滚动一次，再挂上 0 点自动清零的定时器。
+  // Keep only today's data: on load, roll forward by date once, then attach the timer that clears automatically at midnight.
   ensureToday();
   scheduleDailyReset();
   log("activate · 模式=" + modeLabel());
   logKiroHostInfo();
   selfHeal();
-  // 把配置读取、日志、统计埋点递给中转站翻译层。统计走同一套计数器，面板上的
-  // 请求数 / 用量在两种模式下是同一组数字。
+  // Hand config reads, logs, and stats hooks to the relay translation layer. Stats go through the same set of counters, so on the panel the
+  // request count and usage are the same numbers in both modes.
   relay.init({
     prefs: relayPrefs,
     isEnabled,
@@ -7333,8 +7488,8 @@ async function activate(context) {
     },
   });
   try { await migrateLegacyKey(); } catch (e) { log("migrateLegacyKey failed: " + (e?.message || e)); }
-  // 已有密钥补一次添加时间：升级到这个版本之前加的密钥、以及用户直接改配置塞进
-  // 去的密钥，都是在这里第一次拿到时间戳。
+  // Backfill an add-time for keys that already exist: keys added before the upgrade to this version, and keys the user stuffed in by editing the config
+  // directly, all receive their first timestamp here.
   try { await syncKeyAddedAt(); } catch (e) { log("syncKeyAddedAt failed: " + (e?.message || e)); }
 
   panelProvider = new ControlPanelProvider();
@@ -7346,7 +7501,7 @@ async function activate(context) {
     vscode.commands.registerCommand("kiroGateway.openPanel", async () => {
       await vscode.commands.executeCommand("workbench.view.extension.kiroGateway");
     }),
-    // 状态栏的「待重载生效」点击后走这里，也可以从命令面板手动触发。
+    // Clicking "pending reload to take effect" on the status bar comes through here, and it can also be triggered by hand from the command palette.
     vscode.commands.registerCommand("kiroGateway.reloadWindow", async () => {
       await vscode.commands.executeCommand("workbench.action.reloadWindow");
     }),
@@ -7355,12 +7510,12 @@ async function activate(context) {
       await applyState();
       panelProvider && panelProvider.pushState();
     }),
-    // 命令面板里切模式。端点要换端口，所以切完照例提示重载窗口。
+    // Switch mode from the command palette. The endpoints have to change ports, so after the switch, prompt a window reload as usual.
     vscode.commands.registerCommand("kiroGateway.importJsonFiles", async () => {
       const result = await importJsonCredentialFiles();
       if (result.cancelled) return;
       if (result.message && (!result.ingested || !result.ingested.added.length)) {
-        vscode.window.showWarningMessage("Kiro Gateway: " + result.message);
+        vscode.window.showWarningMessage("Kiro Gateway: " + tr(result.message));
         return;
       }
       await applyIngestedCredentials(result.ingested, result.failed);
@@ -7368,53 +7523,56 @@ async function activate(context) {
     vscode.commands.registerCommand("kiroGateway.switchMode", async () => {
       const pick = await vscode.window.showQuickPick(
         [
-          { label: MODE_LABEL.official, description: "官方 ksk_ 密钥直连 Kiro 服务", mode: MODE_OFFICIAL },
-          { label: MODE_LABEL.relay, description: "转发到 Anthropic 格式的第三方中转站", mode: MODE_RELAY },
+          { label: tr(MODE_LABEL.official), description: tr("官方 ksk_ 密钥直连 Kiro 服务"), mode: MODE_OFFICIAL },
+          { label: tr(MODE_LABEL.relay), description: tr("转发到 Anthropic 格式的第三方中转站"), mode: MODE_RELAY },
         ],
-        { title: "选择工作模式", placeHolder: "当前：" + modeLabel() }
+        { title: tr("选择工作模式"), placeHolder: tr("当前：") + modeLabel() }
       );
       if (!pick || pick.mode === getMode()) return;
       await switchModeTo(pick.mode);
     }),
-    // 立即跑一轮真探活。手动触发忽略"每号最短间隔"那道闸 —— 用户自己按的按钮，
-    // 消耗一次生成请求的代价他知道。
+    // Run one real liveness round right away. A manual trigger ignores the "minimum interval per account" gate — the user pressed the button,
+    // and they know it costs one generate request.
     vscode.commands.registerCommand("kiroGateway.livenessCheckNow", async () => {
       if (!getApiKeys().length) {
-        vscode.window.showWarningMessage("Kiro Gateway: 还没有配置密钥，无法探活。");
+        vscode.window.showWarningMessage(tr("Kiro Gateway: 还没有配置密钥，无法探活。"));
         return;
       }
-      vscode.window.showInformationMessage("Kiro Gateway: 开始探活（每把密钥消耗一次生成请求）…");
+      vscode.window.showInformationMessage(tr("Kiro Gateway: 开始探活（每把密钥消耗一次生成请求）…"));
       const r = await runLivenessScan({ manual: true });
       if (r && r.skipped) {
-        vscode.window.showInformationMessage("Kiro Gateway: 上一轮探活还没跑完，稍后再试。");
+        vscode.window.showInformationMessage(tr("Kiro Gateway: 上一轮探活还没跑完，稍后再试。"));
         return;
       }
       const c = (r && r.counts) || {};
-      vscode.window.showInformationMessage(
+      vscode.window.showInformationMessage(tr(
         "Kiro Gateway 探活完成：可用 " + (c.ok || 0)
         + " · 禁用 " + (c.suspended || 0)
         + " · 溢出 " + (c.overage_exceeded || 0)
         + " · 额度用尽 " + (c.quota || 0)
         + " · 失效 " + (c.invalid || 0)
         + ((r && r.deleted) ? " · 已删 " + r.deleted + " 把" : "")
-      );
+      ));
     }),
-    // 命令面板里开关 Agent 命令自动放行，省得去设置里翻。
+    // Toggle automatic approval of Agent commands from the command palette, instead of digging through settings.
     vscode.commands.registerCommand("kiroGateway.toggleAutoAllow", async () => {
       const next = !autoAllowEnabled();
       await set("autoAllow.enabled", next);
-      // 配置变更监听会顺手同步 permissions.yaml，这里只管提示。
+      // The config-change listener syncs permissions.yaml along the way. This only shows the prompt.
       vscode.window.showInformationMessage(
-        "Kiro Gateway: Agent 命令自动放行已" + (next ? "开启" : "关闭")
-        + (next ? "（.git / .vscode / .kiro/agents / .kiro/hooks / *.code-workspace / mcp.json 仍会逐项询问）" : "")
+        uiLocale() === "en"
+          ? "Kiro Gateway: auto-allow Agent commands is " + (next ? "on" : "off")
+            + (next ? " (.git / .vscode / .kiro/agents / .kiro/hooks / *.code-workspace / mcp.json are still asked one by one)" : "")
+          : "Kiro Gateway: Agent 命令自动放行已" + (next ? "开启" : "关闭")
+            + (next ? "（.git / .vscode / .kiro/agents / .kiro/hooks / *.code-workspace / mcp.json 仍会逐项询问）" : "")
       );
     }),
     vscode.commands.registerCommand("kiroGateway.test", async () => {
       try {
         const r = await testKey();
-        vscode.window.showInformationMessage("Kiro Key 有效 · " + (r.subscription || "") + " · " + r.modelCount + " 个模型");
+        vscode.window.showInformationMessage(tr("Kiro Key 有效 · " + (r.subscription || "") + " · " + r.modelCount + " 个模型"));
       } catch (e) {
-        vscode.window.showErrorMessage("Kiro Key 测试失败: " + (e?.message || e));
+        vscode.window.showErrorMessage(tr("Kiro Key 测试失败: " + (e?.message || e)));
       }
     })
   );
@@ -7423,30 +7581,34 @@ async function activate(context) {
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration(async (e) => {
       const hit = (k) => e.affectsConfiguration("kiroGateway." + k);
-      // 权限自动放行：开关一变就立刻同步 permissions.yaml。Kiro 的 PolicySession
-      // 监听这个文件，改完就生效，不用重载窗口。
+      if (hit("language")) {
+        updateStatusBar();
+        if (panelProvider) panelProvider.refreshHtml();
+      }
+      // Automatic permission approval: the moment the switch changes, sync permissions.yaml immediately. Kiro's PolicySession
+      // watches this file, and the change takes effect with no window reload.
       if (hit("autoAllow.enabled")) syncAutoAllow("配置变更");
-      // 探活开关 / 间隔变了就重挂定时器。
+      // When the liveness switch or the interval changes, hang the timer again.
       if (["livenessCheckEnabled", "livenessCheckIntervalSec"].some(hit)) syncLivenessScheduler();
-      // 端点相关配置改了就把当前生效的链打进日志，省得靠猜。
+      // When endpoint-related config changes, log the chain currently in effect, so there is no guessing.
       if (["preferredEndpoint", "endpointFallback", "endpointCooldownMs",
         "endpointRounds", "endpointRoundDelayMs"].some(hit)) logEndpointChain();
-      // 换了区域，"哪个端点支持哪个操作"这份记录就不再适用（能力按端点 + 区域 +
-      // 操作三元组记），清掉重新探。
+      // Once the region changes, the record of which endpoint supports which operation no longer applies (capability is keyed by endpoint + region +
+      // operation), so clear it and probe again.
       if (hit("region")) resetEndpointUnsupported();
-      // 影响代理绑定或端点重定向的配置项，改动后都要重新 applyState。
+      // Config items that affect proxy binding or endpoint redirect all have to run applyState again after a change.
       const needsApply = ["enabled", "apiKeys", "activeApiKey", "region", "ports",
         "mode", "relayBaseUrl", "relayApiKey", "relayPorts"].some(hit);
-      // 只影响翻译行为的配置项，改了不用重绑服务器，刷个面板就行。
+      // Config items that only affect translation behavior do not need the server rebound. Refreshing the panel is enough.
       const relayTweaked = ["relayMaxTokens", "relayThinking", "relayThinkingBudget",
         "relayEffortMode", "relayEffortBudgets", "relayDefaultModel", "relayModelMapping",
         "relayInterceptIntentClassifier", "relayPromptCaching"].some(hit);
       if (!needsApply && !relayTweaked) return;
-      // 直接改配置加进来的密钥也要有添加时间。
+      // A key added by editing the config directly needs an add-time too.
       if (hit("apiKeys")) {
         try { await syncKeyAddedAt(); } catch {}
       }
-      // 换了站点或换了 Key，上一个站点的模型列表和用量口径都不能再用。
+      // Once the site or the Key changes, the previous site's model list and usage figures must not be reused.
       if (hit("relayBaseUrl") || hit("relayApiKey")) relay.invalidateRelayCaches();
       if (needsApply) await applyState({ silent: true });
       panelProvider && panelProvider.pushState();
@@ -7455,17 +7617,17 @@ async function activate(context) {
 
   await applyState({ silent: true });
   updateStatusBar();
-  // 权限自动放行：按当前开关同步一次 ~/.kiro/settings/permissions.yaml。
+  // Automatic permission approval: sync ~/.kiro/settings/permissions.yaml once, according to the current switch.
   syncAutoAllow("启动");
-  // 把生效的生成端点链打进日志，方便确认首选端点和回退参数。
+  // Log the generate-endpoint chain that is in effect, so the preferred endpoint and the fallback parameters are easy to confirm.
   logEndpointChain();
-  // 自动续号：开着就把心跳挂起来，可用密钥掉到阈值以下会自己去号池补。
+  // Automatic refill: when it is on, start the heartbeat. When usable keys fall below the threshold, it goes to the pool and refills on its own.
   syncRenewLoop();
-  // 启动时后台识别一次地区（自动模式 + 已有密钥时）。不 await：识别要发两个网络
-  // 请求，不该拖慢插件激活；结果出来后会自己写配置、刷面板和状态栏。
+  // At startup, detect the region once in the background (automatic mode, and only when a key already exists). Do not await it: detection sends two network
+  // requests and must not slow plugin activation. When the result comes back it writes the config and refreshes the panel and the status bar on its own.
   ensureRegionDetected({ silent: true }).catch(() => {});
-  // 首轮账号巡检延后一点再跑：激活这会儿地区识别、端点校验都在飞，别挤在一起。
-  // 之后交给 HEALTH_SWEEP_MS 的心跳。
+  // Delay the first account sweep a little: during activation, region detection and endpoint checks are both in flight, so do not pile them together.
+  // After that, leave it to the HEALTH_SWEEP_MS heartbeat.
   const firstSweep = setTimeout(() => { healthSweepOnce().catch(() => {}); }, 20000);
   context.subscriptions.push({ dispose: () => clearTimeout(firstSweep) });
 }
@@ -7488,9 +7650,9 @@ function deactivate() {
     _statsFlushTimer = null;
     persistStatsNow();
   }
-  // 这两个节流定时器原先漏在外面。窗口重载时它们还挂着，回调醒来时面板早就没了
-  // （pushStats 里有 panelProvider 判空所以不会报错），但 _activeSyncTimer 会在
-  // 卸载之后再写一次配置，属于不该发生的副作用。
+  // These two throttled timers used to be left outside. On a window reload they were still pending, and by the time the callback woke the panel was long gone
+  // (pushStats checks that panelProvider is non-null, so it does not throw), but _activeSyncTimer would write the config once more
+  // after deactivation, a side effect that should not happen.
   if (_statsPushTimer) { clearTimeout(_statsPushTimer); _statsPushTimer = null; }
   if (_activeSyncTimer) { clearTimeout(_activeSyncTimer); _activeSyncTimer = null; _activeSyncWant = ""; }
 }

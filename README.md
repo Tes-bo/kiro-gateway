@@ -56,11 +56,11 @@ Saved relay settings are restored when the panel is opened again.
 
 ## Theme and language
 
-The panel follows Kiro's light and dark theme. The interface text is still Chinese. An English interface is not in 2.0.0 yet.
+The panel follows Kiro's light and dark theme. Text follows Kiro's language. Chinese and English are both included. `kiroGateway.language` can force one of them (`auto`, `zh`, or `en`). The button at the top of the panel switches between 中文 and EN.
 
-## Known limit
+## Routes
 
-The two buttons at the top of the panel change the live mode, not just the page you are looking at. If the gateway switch is on, choosing the other mode starts that mode and stops the one that was running. A later version will keep page navigation separate from the mode that is actually in use, and will ask before switching.
+The two buttons at the top only change the page. The route that is running keeps running, including while this window is on standby and another window owns the ports. A line under the buttons names the live route. Use this page's route and reload asks before stopping it. Cancel leaves the current route running. Confirming writes the mode, rebinds the ports, and reloads the window. The gateway switch still turns the live route on or off.
 
 ## Development
 

@@ -2,7 +2,7 @@
 	"name": "kiro-gateway",
 	"displayName": "Kiro Gateway",
 	"description": "Route Kiro's built-in chat through your own API key, JSON login, or an Anthropic-compatible relay.",
-	"version": "2.0.3",
+	"version": "2.0.4",
 	"publisher": "tesbo",
 	"license": "MIT",
 	"repository": {
@@ -108,7 +108,7 @@
 			"properties": {
 				"codewhisperer.config.krsEndpoints": {
 					"type": "array",
-					"description": "生成面端点。网关打开时由插件写成 http://127.0.0.1 上的本地端口。必须在本插件里注册，否则 SSH 上 Kiro 的 get() 读不到 settings.json 里的值，模型列表和对话都会继续走官方地址。",
+					"description": "%kiroGateway.nls.0%",
 					"default": [],
 					"items": {
 						"type": "object",
@@ -120,7 +120,7 @@
 				},
 				"codewhisperer.config.cpsEndpoints": {
 					"type": "array",
-					"description": "控制面端点。模型下拉框来自这里。和 krsEndpoints 一样必须注册，SSH 上才会生效。",
+					"description": "%kiroGateway.nls.1%",
 					"default": [],
 					"items": {
 						"type": "object",
@@ -133,7 +133,7 @@
 				"kiroGateway.enabled": {
 					"type": "boolean",
 					"default": false,
-					"description": "Master switch. When on, Kiro's built-in AI calls are routed through your Kiro API key. When off, Kiro uses its official service unchanged."
+					"description": "%kiroGateway.nls.43%"
 				},
 				"kiroGateway.apiKeys": {
 					"type": "array",
@@ -141,22 +141,22 @@
 						"type": "string"
 					},
 					"default": [],
-					"description": "Your Kiro credentials: official API keys (ksk_...) and/or JSON login placeholders (json_...). JSON token payloads live in globalState, not in this array. Managed from the Control Panel."
+					"description": "%kiroGateway.nls.44%"
 				},
 				"kiroGateway.activeApiKey": {
 					"type": "string",
 					"default": "",
-					"description": "The currently selected API key used for connections (must be one of apiKeys). Falls back to the first key."
+					"description": "%kiroGateway.nls.45%"
 				},
 				"kiroGateway.apiKey": {
 					"type": "string",
 					"default": "",
-					"description": "Deprecated: legacy single API key. Auto-migrated into apiKeys."
+					"description": "%kiroGateway.nls.46%"
 				},
 				"kiroGateway.region": {
 					"type": "string",
 					"default": "us-east-1",
-					"description": "The AWS region your Kiro API key belongs to. By default the Control Panel detects this automatically (us-east-1 / eu-central-1) and keeps this value in sync; picking a fixed region in the panel turns detection off."
+					"description": "%kiroGateway.nls.47%"
 				},
 				"kiroGateway.ports": {
 					"type": "object",
@@ -164,32 +164,32 @@
 						"krs": 19820,
 						"cps": 19821
 					},
-					"description": "Local proxy ports. krs = AI generation plane, cps = control plane (models/usage)."
+					"description": "%kiroGateway.nls.48%"
 				},
 				"kiroGateway.livenessCheckEnabled": {
 					"type": "boolean",
 					"default": false,
-					"description": "推理平面真探活：定期给每把密钥发一个最小的生成请求，用来发现「用量接口正常、但对话已被拒」的号（账号被风控锁住时往往只挡推理接口）。注意每次真探消耗一次生成请求，所以默认关闭。"
+					"description": "%kiroGateway.nls.2%"
 				},
 				"kiroGateway.livenessCheckIntervalSec": {
 					"type": "number",
 					"default": 60,
-					"description": "探活扫描间隔（秒，10-3600）。单把密钥实际被探的频率还受 livenessRealCheckPerKeyIntervalSec 限制。"
+					"description": "%kiroGateway.nls.3%"
 				},
 				"kiroGateway.livenessRealCheckPerKeyIntervalSec": {
 					"type": "number",
 					"default": 60,
-					"description": "同一把密钥最短多久才被真探一次（秒，10-3600）。这道闸防止扫描过密时把额度烧在探活上。"
+					"description": "%kiroGateway.nls.4%"
 				},
 				"kiroGateway.autoDeleteOnDead": {
 					"type": "boolean",
 					"default": true,
-					"description": "密钥彻底不可用时自动从列表里删掉，默认开启。只对三种情况生效：账号被禁用、溢出额度打满、月配额用尽，而且都要有上游明确拒绝服务的响应作依据（转发撞墙、账户巡检或真探活拿到的）。凭证无效不删——那可能只是输错了，也可能是跨区被拒的误判。用量接口显示 used>=total 也不删，因为 POWER 号超出基础配额后还有溢出额度可用。删除正在使用的密钥不会关闭网关：会自动切到剩余可用号，池子空了也保持开启，等号池续号补进来。"
+					"description": "%kiroGateway.nls.5%"
 				},
 				"kiroGateway.autoAllow.enabled": {
 					"type": "boolean",
 					"default": false,
-					"description": "自动放行 Agent 的命令确认弹窗：往 ~/.kiro/settings/permissions.yaml 写入一条 capability all / effect allow 规则（等同 Kiro 内置的 allow-all 预设），Kiro 会热加载，不用重载窗口。关掉时只回收插件自己写的那一段，你手写的规则不动。注意 .git、.vscode、.kiro/agents、.kiro/hooks、*.code-workspace、mcp.json 这六项由 Kiro 无条件强制询问，本开关无法覆盖。"
+					"description": "%kiroGateway.nls.6%"
 				},
 				"kiroGateway.preferredEndpoint": {
 					"type": "string",
@@ -198,51 +198,62 @@
 						"q"
 					],
 					"enumDescriptions": [
-						"KiroKRS：runtime.{region}.kiro.dev，IDE 原生的生成平面（默认）。",
-						"AmazonQ：q.{region}.amazonaws.com，同账号同计费池的另一个生成平面。"
+						"%kiroGateway.nls.8%",
+						"%kiroGateway.nls.9%"
 					],
 					"default": "krs",
-					"description": "生成请求首选哪个端点。两个端点的 429 限流桶完全独立，首选端点被限流时会自动回退到另一个。"
+					"description": "%kiroGateway.nls.7%"
 				},
 				"kiroGateway.endpointFallback": {
 					"type": "boolean",
 					"default": true,
-					"description": "撞上 429 限流时自动换到另一个生成端点重发（不换密钥、不计重试次数）。429 是端点级速率限制，换端点通常立刻就通。"
+					"description": "%kiroGateway.nls.10%"
 				},
 				"kiroGateway.endpointCooldownMs": {
 					"type": "number",
 					"default": 5000,
-					"description": "某个端点刚因限流失败后，后续请求多久之内不再从它起步。限流恢复是亚秒级的，压几秒就够，压太久等于在已恢复的端点上白等。"
+					"description": "%kiroGateway.nls.11%"
 				},
 				"kiroGateway.endpointRounds": {
 					"type": "number",
 					"default": 2,
-					"description": "一次请求内端点链最多走几轮（1-5）。本轮所有端点都被限流时，退避一次再重走一遍。"
+					"description": "%kiroGateway.nls.12%"
 				},
 				"kiroGateway.endpointRoundDelayMs": {
 					"type": "number",
 					"default": 1500,
-					"description": "端点链轮次之间的退避时长，也是能力缺失改道和上游故障重试的退避基数。"
+					"description": "%kiroGateway.nls.13%"
 				},
 				"kiroGateway.throttleRetryForever": {
 					"type": "boolean",
 					"default": true,
-					"description": "限流耐心模式：端点轮次用尽后不把 429 交回 Kiro，改用指数退避一直重试，只有你在 Kiro 里点取消才停。关掉则恢复「轮次用尽即报错」的行为。"
+					"description": "%kiroGateway.nls.14%"
 				},
 				"kiroGateway.throttleBackoffCapMs": {
 					"type": "number",
 					"default": 30000,
-					"description": "耐心模式下指数退避的稳态上限，防止把上游打成 DoS。"
+					"description": "%kiroGateway.nls.15%"
 				},
 				"kiroGateway.serverErrorRetry": {
 					"type": "boolean",
 					"default": true,
-					"description": "上游临时故障（5xx / InternalServerException）和传输层故障（TLS 握手被本机代理掐断、连接重置）自动退避重发，不换密钥、不换端点。"
+					"description": "%kiroGateway.nls.16%"
 				},
 				"kiroGateway.serverErrorRetryMax": {
 					"type": "number",
 					"default": 5,
-					"description": "临时故障最多重试几次（1-20）。连续 5xx 更可能是账号额度用尽导致上游行为不稳定，所以这里有次数上限，不像限流那样无限等。"
+					"description": "%kiroGateway.nls.17%"
+				},
+				"kiroGateway.language": {
+					"type": "string",
+					"enum": ["auto", "zh", "en"],
+					"enumDescriptions": [
+						"%kiroGateway.nls.50%",
+						"%kiroGateway.nls.51%",
+						"%kiroGateway.nls.52%"
+					],
+					"default": "auto",
+					"description": "%kiroGateway.nls.49%"
 				},
 				"kiroGateway.mode": {
 					"type": "string",
@@ -251,21 +262,21 @@
 						"relay"
 					],
 					"enumDescriptions": [
-						"APIKEY 直连：用官方 ksk_ 密钥直连 Kiro 服务，零协议翻译。",
-						"中转站：把请求翻译成 Anthropic 格式转发到第三方中转站。"
+						"%kiroGateway.nls.19%",
+						"%kiroGateway.nls.20%"
 					],
 					"default": "official",
-					"description": "工作模式。official = APIKEY 直连；relay = 中转站。两种模式各用一套端口，互不干扰。"
+					"description": "%kiroGateway.nls.18%"
 				},
 				"kiroGateway.relayBaseUrl": {
 					"type": "string",
 					"default": "",
-					"description": "中转站模式：中转站地址（Anthropic 端点格式），例如 https://your-relay.com/v1 。没写 /v1 会自动补上。"
+					"description": "%kiroGateway.nls.21%"
 				},
 				"kiroGateway.relayApiKey": {
 					"type": "string",
 					"default": "",
-					"description": "中转站模式：中转站的 API Key（通常形如 sk-...）。"
+					"description": "%kiroGateway.nls.22%"
 				},
 				"kiroGateway.relayPorts": {
 					"type": "object",
@@ -273,12 +284,12 @@
 						"krs": 19830,
 						"cps": 19831
 					},
-					"description": "中转站模式的本地代理端口，与 APIKEY 直连的 19820/19821 隔离，切换模式时不会互相干扰。"
+					"description": "%kiroGateway.nls.23%"
 				},
 				"kiroGateway.relayMaxTokens": {
 					"type": "number",
 					"default": 32000,
-					"description": "中转站模式：单次回答的最大输出 token 数。"
+					"description": "%kiroGateway.nls.24%"
 				},
 				"kiroGateway.relayThinking": {
 					"type": "string",
@@ -288,17 +299,17 @@
 						"disabled"
 					],
 					"enumDescriptions": [
-						"自动：模型名里带 thinking 的才开启扩展思考。",
-						"始终开启扩展思考。",
-						"始终关闭扩展思考。"
+						"%kiroGateway.nls.26%",
+						"%kiroGateway.nls.27%",
+						"%kiroGateway.nls.28%"
 					],
 					"default": "auto",
-					"description": "中转站模式：扩展思考（extended thinking）开关。"
+					"description": "%kiroGateway.nls.25%"
 				},
 				"kiroGateway.relayThinkingBudget": {
 					"type": "number",
 					"default": 8192,
-					"description": "中转站模式：扩展思考的 token 预算。会自动留出 4096 给正文，预算过大时向下夹紧。"
+					"description": "%kiroGateway.nls.29%"
 				},
 				"kiroGateway.relayEffortMode": {
 					"type": "string",
@@ -309,13 +320,13 @@
 						"off"
 					],
 					"enumDescriptions": [
-						"自动（推荐）：中转站有档位变体模型就换模型，否则把档位原样传下去。",
-						"模型变体：把档位映射成 模型名-档位 形式的模型。",
-						"思考预算：把档位折算成扩展思考的 token 预算。",
-						"关闭：忽略 Kiro 的档位选择。"
+						"%kiroGateway.nls.31%",
+						"%kiroGateway.nls.32%",
+						"%kiroGateway.nls.33%",
+						"%kiroGateway.nls.34%"
 					],
 					"default": "auto",
-					"description": "中转站模式：Kiro 的 max/xhigh/high/medium/low 思考档位如何落到上游请求上。"
+					"description": "%kiroGateway.nls.30%"
 				},
 				"kiroGateway.relayEffortBudgets": {
 					"type": "object",
@@ -326,22 +337,22 @@
 						"xhigh": 16384,
 						"max": 24576
 					},
-					"description": "中转站模式：各思考档位对应的 token 预算（relayEffortMode=thinkingBudget 时生效）。"
+					"description": "%kiroGateway.nls.35%"
 				},
 				"kiroGateway.relayDefaultModel": {
 					"type": "string",
 					"default": "",
-					"description": "中转站模式：兜底的上游模型 ID。留空表示把 Kiro 的模型 ID 原样透传。"
+					"description": "%kiroGateway.nls.36%"
 				},
 				"kiroGateway.relayModelMapping": {
 					"type": "object",
 					"default": {},
-					"description": "中转站模式：Kiro 内部模型 ID → 上游模型 ID 的映射表，优先级高于 relayDefaultModel。"
+					"description": "%kiroGateway.nls.37%"
 				},
 				"kiroGateway.relayInterceptIntentClassifier": {
 					"type": "boolean",
 					"default": true,
-					"description": "中转站模式：本地应答 Kiro 的意图分类请求，每轮对话省一次上游调用。"
+					"description": "%kiroGateway.nls.38%"
 				},
 				"kiroGateway.relayPromptCaching": {
 					"type": "string",
@@ -351,12 +362,12 @@
 						"off"
 					],
 					"enumDescriptions": [
-						"自动（推荐）：只给 Claude/Anthropic 模型加缓存断点。",
-						"全部模型：非 Claude 模型也加。仅在确认中转站能安全透传 cache_control 时使用。",
-						"关闭：从不发送 cache_control。"
+						"%kiroGateway.nls.40%",
+						"%kiroGateway.nls.41%",
+						"%kiroGateway.nls.42%"
 					],
 					"default": "auto",
-					"description": "中转站模式：是否给请求加 Anthropic 提示词缓存断点（cache_control），让重复的对话前缀被复用。"
+					"description": "%kiroGateway.nls.39%"
 				}
 			}
 		}

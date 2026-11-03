@@ -1,13 +1,13 @@
 // ---------------------------------------------------------------------------
-// 中转站模式（relay）：把 Kiro 的 CodeWhisperer 请求翻译成 Anthropic Messages
-// API 发给任意兼容中转站，再把上游的 SSE 流实时翻回 Kiro 能识别的 AWS
-// event-stream 二进制帧。
+// Relay mode: translate Kiro's CodeWhisperer requests into the Anthropic Messages
+// API, send them to any compatible relay, then translate the upstream SSE stream in real time back into the AWS
+// event-stream binary frames that Kiro can recognize.
 //
-// 官方直连模式（official）是「换凭证透传」，零协议翻译；中转站模式是「协议翻译」，
-// 两者共用同一套端点重定向机制，但各自占用独立端口，互不干扰。
+// Official direct mode (official) is "swap credentials and pass through", with zero protocol translation; relay mode is "protocol translation".
+// The two share the same endpoint-redirection mechanism, but each occupies its own port and they do not interfere.
 //
-// 本文件刻意不 require("vscode")：所有配置读取、日志、统计埋点都由 extension.js
-// 在启动时通过 init() 注入，这样翻译层保持纯粹，也避免和主文件循环依赖。
+// This file deliberately does not require("vscode"): all config reads, logging, and stats instrumentation are injected by extension.js
+// at startup through init(), so the translation layer stays pure and a circular dependency with the main file is avoided.
 // ---------------------------------------------------------------------------
 "use strict";
 
@@ -15,9 +15,9 @@ const http = require("http");
 const https = require("https");
 const { StringDecoder } = require("string_decoder");
 
-// --- 宿主注入 ---------------------------------------------------------------
-// extension.js 在 activate 时调用 init() 把这些能力递进来。给一份空实现兜底，
-// 万一忘了注入也只是没日志没统计，不会抛异常把请求打断。
+// --- Host injection ---------------------------------------------------------------
+// extension.js calls init() during activate to hand these capabilities in. An empty implementation is the fallback,
+// so if injection is forgotten there is simply no logging and no stats; it will not throw and interrupt the request.
 let host = {
   prefs: () => ({}),
   isEnabled: () => false,
@@ -29,7 +29,7 @@ let host = {
     requestFailed: () => {},
     requestFinished: () => {},
   },
-  // 固定前置/后置提示词：中转站模式同样复用面板上那份配置。
+  // Fixed prefix/suffix prompts: relay mode reuses that same config from the panel.
   applyPromptPrefs: (buf) => ({ buf, applied: "" }),
 };
 
@@ -47,14 +47,14 @@ function prefs() {
 }
 
 // ---------------------------------------------------------------------------
-// AWS event-stream 帧编码
+// AWS event-stream frame encoding
 //
-// Kiro 的 runtime 端点回的是 application/vnd.amazon.eventstream：一串二进制帧，
-// 每帧 = 总长(4) + 头部长(4) + 前缀CRC(4) + 头部 + 载荷 + 整帧CRC(4)。
-// 中转站给的是文本 SSE，所以每个事件都要按这个格式重新打包。
+// Kiro's runtime endpoint returns application/vnd.amazon.eventstream: a sequence of binary frames,
+// each frame = total length (4) + headers length (4) + prelude CRC (4) + headers + payload + message CRC (4).
+// The relay returns text SSE, so every event has to be repacked in this format.
 // ---------------------------------------------------------------------------
 const EVENT_STREAM_CONTENT_TYPE = "application/vnd.amazon.eventstream";
-const HEADER_TYPE_STRING = 7; // 头部值类型：UTF-8 字符串
+const HEADER_TYPE_STRING = 7; // Header value type: UTF-8 string
 
 const CRC32_TABLE = (() => {
   const table = new Uint32Array(256);
@@ -94,11 +94,11 @@ function encodeFrame(headers, payload) {
   let off = 0;
   buf.writeUInt32BE(total, off); off += 4;
   buf.writeUInt32BE(headersLen, off); off += 4;
-  // 前缀 CRC 只覆盖前 8 字节（两个长度字段）。
+  // The prelude CRC covers only the first 8 bytes (the two length fields).
   buf.writeUInt32BE(crc32(buf, 0, 8), off); off += 4;
   headers.copy(buf, off); off += headersLen;
   payload.copy(buf, off); off += payload.length;
-  // 整帧 CRC 覆盖到载荷结束。
+  // The message CRC covers through the end of the payload.
   buf.writeUInt32BE(crc32(buf, 0, off), off);
   return buf;
 }
@@ -121,8 +121,8 @@ function encodeException(exceptionType, payload) {
   return encodeFrame(headers, Buffer.from(JSON.stringify(payload), "utf8"));
 }
 
-// 把一个中间态事件对象写成对应的 CodeWhisperer 帧。返回写出的字节数，便于统计
-// 里那个「输出 token 估算」跟官方直连模式对齐。
+// Write an intermediate event object out as the corresponding CodeWhisperer frame. The bytes written are returned so the
+// "output token estimate" in the stats lines up with official direct mode.
 function writeEvent(res, ev) {
   let buf = null;
   if (ev.assistantResponseEvent) {
@@ -130,7 +130,7 @@ function writeEvent(res, ev) {
   } else if (ev.messageMetadataEvent) {
     buf = encodeEvent("messageMetadataEvent", ev.messageMetadataEvent);
   } else if (ev.toolUseEvent) {
-    // stop:true 告诉 Kiro 这个工具调用的入参已经完整，可以执行了。
+    // stop:true tells Kiro this tool call's input is complete and can be executed.
     buf = encodeEvent("toolUseEvent", { ...ev.toolUseEvent, stop: true });
   } else if (ev.reasoningContentEvent) {
     buf = encodeEvent("reasoningContentEvent", ev.reasoningContentEvent);
@@ -145,10 +145,10 @@ function writeEvent(res, ev) {
 }
 
 // ---------------------------------------------------------------------------
-// 上游请求：中转站地址可能是自建的 http 服务，所以走原生 http/https 而不是 fetch。
+// Upstream requests: the relay address may be a self-hosted http service, so use native http/https instead of fetch.
 // ---------------------------------------------------------------------------
-const UPSTREAM_TIMEOUT_MS = 30 * 60 * 1000; // 生成类请求可以很久，留足余量
-const PROBE_TIMEOUT_MS = 15 * 1000;         // 模型列表 / 用量这类小请求
+const UPSTREAM_TIMEOUT_MS = 30 * 60 * 1000; // Generation requests can take a long time; leave plenty of headroom
+const PROBE_TIMEOUT_MS = 15 * 1000;         // Small requests such as the model list / usage
 
 function requestUpstream(method, urlStr, headers, body, timeoutMs = UPSTREAM_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
@@ -187,7 +187,7 @@ function requestUpstream(method, urlStr, headers, body, timeoutMs = UPSTREAM_TIM
   });
 }
 
-// 把响应体读成字符串。上限保护：中转站要是回一个大文件，不能把内存吃穿。
+// Read the response body into a string. The cap is protection: if the relay returns a large file, it must not exhaust memory.
 const BODY_CAP = 2 * 1024 * 1024;
 function readBody(stream) {
   return new Promise((resolve, reject) => {
@@ -214,16 +214,16 @@ async function getJson(urlStr, headers, timeoutMs = PROBE_TIMEOUT_MS) {
 }
 
 // ---------------------------------------------------------------------------
-// 地址拼装
+// URL assembly
 //
-// 用户填的可能是 https://x.com、https://x.com/v1 或 https://x.com/v1/。统一成
-// 「基址 + /messages」这种 Anthropic 端点形式，同时保留根地址供用量接口用。
+// The user may enter https://x.com, https://x.com/v1, or https://x.com/v1/. Normalize them into
+// the Anthropic endpoint form "base + /messages", and keep the root address for the usage API.
 // ---------------------------------------------------------------------------
 function baseUrlRaw() {
   return String(prefs().baseUrl || "").trim().replace(/\/+$/, "");
 }
 
-// Anthropic 端点：没写 /v1 的自动补上，避免用户少填一段就 404。
+// Anthropic endpoint: if /v1 was left off, append it automatically so a missing segment does not 404.
 function resolveApiUrl(apiPath) {
   const base = baseUrlRaw();
   if (!base) return "";
@@ -232,7 +232,7 @@ function resolveApiUrl(apiPath) {
   return base + "/v1" + p;
 }
 
-// 站点根地址：用量 / 计费这些接口挂在站点根上，不在 /v1 下面。
+// Site root: usage / billing APIs are mounted on the site root, not under /v1.
 function resolveRootUrl(urlPath) {
   const base = baseUrlRaw();
   if (!base) return "";
@@ -240,9 +240,9 @@ function resolveRootUrl(urlPath) {
   const p = urlPath.startsWith("/") ? urlPath : "/" + urlPath;
   return root + p;
 }
-// 中转站的网页地址：把 baseUrl 末尾的 /v1 去掉就是站点根。面板上那个「网页面板」
-// 按钮跳这里 —— 插件只认接口，账单明细、充值记录这些还是得去人家网站上看。
-// 推不出来就返回空串，按钮自己隐藏。
+// The relay's web address: stripping a trailing /v1 from baseUrl gives the site root. The panel's "web panel"
+// button goes here -- the extension only speaks the API; bill details and top-up records still have to be viewed on their site.
+// If it cannot be derived, return an empty string and the button hides itself.
 function relaySiteUrl() {
   const base = baseUrlRaw();
   if (!base) return "";
@@ -253,16 +253,16 @@ function relayApiKey() {
   return String(prefs().apiKey || "").trim();
 }
 
-// 中转站配置齐了没有。面板和 KRS 处理器都用它来决定要不要提示用户去填。
+// Whether the relay is fully configured. The panel and the KRS handler both use this to decide whether to prompt the user to fill it in.
 function relayConfigured() {
   return !!baseUrlRaw() && !!relayApiKey();
 }
 
 // ---------------------------------------------------------------------------
-// 模型仓库：从中转站 /v1/models 拉一份清单缓存起来。
+// Model catalog: fetch a list from the relay's /v1/models and cache it.
 //
-// Kiro 的模型下拉框来自 CPS 的 ListAvailableModels，所以这份清单直接决定用户在
-// 编辑器里能选什么模型。
+// Kiro's model dropdown comes from CPS ListAvailableModels, so this list directly decides which models
+// the user can pick in the editor.
 // ---------------------------------------------------------------------------
 const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
 const DEFAULT_EFFORT_LEVEL = "high";
@@ -271,7 +271,7 @@ const MODEL_TTL_MS = 60 * 1000;
 
 let _modelCache = [];
 let _modelCacheAt = 0;
-let _modelAuthStyle = "";  // 上次成功的认证风格，下次优先用它
+let _modelAuthStyle = "";  // Auth style that succeeded last time; prefer it next time
 let _modelLastError = "";
 
 function parseContextWindow(m) {
@@ -281,8 +281,8 @@ function parseContextWindow(m) {
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
-// 中转站的认证头有两种流派：Anthropic 原生的 x-api-key，和 OpenAI 风格的
-// Authorization: Bearer。两种都试一遍，谁成谁留下。
+// Relay auth headers come in two styles: Anthropic's native x-api-key, and OpenAI-style
+// Authorization: Bearer. Try both; whichever succeeds is the one we keep.
 function buildModelHeaders(style, apiKey) {
   return style === "bearer"
     ? { Authorization: "Bearer " + apiKey, Accept: "application/json" }
@@ -334,7 +334,7 @@ async function fetchRelayModels(force = false) {
     try {
       const res = await requestUpstream("GET", url, buildModelHeaders(style, apiKey), undefined, PROBE_TIMEOUT_MS);
       const text = await readBody(res.body);
-      // 401/403 说明这种认证风格不对路，换另一种再试，不当成硬错误。
+      // 401/403 means this auth style is the wrong fit; try the other one, and do not treat it as a hard error.
       if (res.statusCode === 401 || res.statusCode === 403) {
         lastErr = "HTTP " + res.statusCode + "（认证方式 " + style + " 被拒）";
         continue;
@@ -376,7 +376,7 @@ function clearModelCache() {
   _modelLastError = "";
 }
 
-// 中转站是否单独提供了「基础模型 + 档位后缀」这种变体（如 xxx-high）。
+// Whether the relay separately offers a "base model + effort suffix" variant (e.g. xxx-high).
 function hasEffortVariant(base, effort) {
   const target = (String(base || "") + "-" + String(effort || "")).toLowerCase();
   if (!base || !effort) return false;
@@ -395,8 +395,8 @@ function thinkingVariantOf(base) {
   return hit ? hit.id : "";
 }
 
-// 把 xxx、xxx-high、xxx-max 归并成一个基础模型 + 一组可选档位，这样 Kiro 的下拉
-// 框里是「一个模型 + 档位选择」，而不是一堆看着重复的条目。
+// Collapse xxx, xxx-high, and xxx-max into one base model plus a set of selectable effort levels, so Kiro's dropdown
+// shows "one model + an effort picker" instead of a pile of entries that look duplicated.
 function groupModelsByEffort(models) {
   const map = new Map();
   const order = [];
@@ -430,10 +430,10 @@ function groupModelsByEffort(models) {
 }
 
 // ---------------------------------------------------------------------------
-// 思考档位（effort）
+// Thinking effort
 //
-// Kiro 的模型选择器带 max/xhigh/high/medium/low 档位。中转站不一定认这套，所以
-// 按配置翻译成「模型变体」或「思考预算」。
+// Kiro's model picker has max/xhigh/high/medium/low effort levels. A relay may not recognize that set, so
+// translate it according to the config into a "model variant" or a "thinking budget".
 // ---------------------------------------------------------------------------
 const DEFAULT_EFFORT_BUDGETS = { low: 2048, medium: 4096, high: 8192, xhigh: 16384, max: 24576 };
 const VALID_EFFORTS = new Set(EFFORT_LEVELS);
@@ -459,7 +459,7 @@ function budgetForEffort(effort) {
   return Number.isFinite(v) && v > 0 ? v : DEFAULT_EFFORT_BUDGETS[e];
 }
 
-// 档位可能藏在请求体好几个位置，取决于 Kiro 的版本，全都翻一遍。
+// The effort level may be hidden in several places in the request body, depending on the Kiro version; check all of them.
 function effortFromRequest(req) {
   const cm = req?.conversationState?.currentMessage?.userInputMessage;
   const candidates = [
@@ -485,8 +485,8 @@ function rememberEffort(convId, effort) {
   _effortCache.set(convId, effort);
 }
 
-// 请求体里没带档位时退回同一会话上一轮记住的值 —— Kiro 只在切换档位的那一轮把
-// 它写进请求体，后续轮次会省掉。
+// When the request body carries no effort level, fall back to the value remembered from the previous turn of the same conversation -- Kiro only writes
+// it into the request body on the turn where the level is switched, and omits it on later turns.
 function selectedEffort(req) {
   const convId = req?.conversationState?.conversationId || "";
   const fromReq = effortFromRequest(req);
@@ -499,27 +499,27 @@ function selectedEffort(req) {
 }
 
 // ---------------------------------------------------------------------------
-// 翻译层：CodeWhisperer 请求体 → Anthropic Messages 请求体
+// Translation layer: CodeWhisperer request body → Anthropic Messages request body
 //
-// Kiro 发来的结构大致是：
+// The structure Kiro sends is roughly:
 //   conversationState: {
 //     conversationId, history: [...], currentMessage: {...}
 //   }
-// history 里交替出现 userInputMessage / assistantResponseMessage，工具调用与
-// 工具结果分别挂在两侧。Anthropic 那边是扁平的 messages 数组 + content 块。
+// history alternates userInputMessage / assistantResponseMessage; tool calls and
+// tool results are attached on the two sides respectively. On the Anthropic side it is a flat messages array plus content blocks.
 // ---------------------------------------------------------------------------
-// 请求里一个 modelId 都没有时的最后兜底。只是最后一道 —— 见 fallbackModelId()，
-// 优先用中转站自己报上来的模型，写死的名字换一家中转站就可能不认。
+// Last-resort fallback when the request contains no modelId at all. Only the last line of defense -- see fallbackModelId();
+// prefer a model the relay itself reported. A hardcoded name may not be recognized if you switch relays.
 const LAST_RESORT_MODEL_ID = "CLAUDE_SONNET_4_20250514_V1_0";
 
-// 兜底模型 ID 取自已拉到的模型列表首项（同 buildCpsModelList 交给 Kiro 的默认项），
-// 列表还没拉到时才退回常量。
+// The fallback model ID is taken from the first item of the model list already fetched (the same default buildCpsModelList hands to Kiro);
+// only fall back to the constant when the list has not been fetched yet.
 function fallbackModelId() {
   return _modelCache[0]?.id || LAST_RESORT_MODEL_ID;
 }
 
-// 助手历史里的思考块。Anthropic 要求 thinking 块必须带签名才能回传，缺一个就不
-// 能带上，否则上游会以为签名被篡改而报错。
+// Thinking blocks in assistant history. Anthropic requires a thinking block to carry a signature before it can be sent back; if either piece is missing it
+// cannot be included, or the upstream will assume the signature was tampered with and return an error.
 function extractThinkingBlock(arm) {
   const rc = arm.reasoningContent;
   let text;
@@ -535,7 +535,7 @@ function extractThinkingBlock(arm) {
   return null;
 }
 
-// 取最后一次用户消息带的 modelId —— 用户中途换模型时，以最新那次为准。
+// Take the modelId from the latest user message -- if the user switches models midway, the newest one wins.
 function latestModelId(req) {
   const items = [
     ...(req.conversationState?.history || []),
@@ -552,8 +552,8 @@ function conversationIdOf(req) {
   return req?.conversationState?.conversationId || "unknown";
 }
 
-// Kiro 内部模型 ID → 中转站模型 ID。先查用户的映射表，再看兜底模型，都没配就原样
-// 透传（很多中转站直接认 Kiro 的 ID）。
+// Kiro internal model ID → relay model ID. Check the user's mapping table first, then the fallback model; if neither is set, pass it through as-is
+// (many relays accept Kiro IDs directly).
 function resolveModel(kiroModelId) {
   const mapping = prefs().modelMapping || {};
   if (mapping[kiroModelId]) return String(mapping[kiroModelId]);
@@ -572,7 +572,7 @@ function parseToolSpec(spec) {
   return { name: ts.name || "", description: ts.description, schema };
 }
 
-// 工具结果的形态五花八门（字符串、{text}、{json}、数组混排），压成纯文本最稳。
+// Tool results come in many shapes (string, {text}, {json}, mixed arrays); squashing them to plain text is the most reliable.
 function toolResultToText(content) {
   if (content == null) return "";
   if (typeof content === "string") return content;
@@ -605,8 +605,8 @@ function parseToolInput(input) {
   return input ?? {};
 }
 
-// Kiro 把「当前打开的文件」「#File 引用」这些塞在 userInputMessageContext 里，
-// Anthropic 没有对应字段，拼成带标记的文本附在用户消息后面。
+// Kiro stuffs "the currently open file", "#File references", and the like into userInputMessageContext.
+// Anthropic has no corresponding field, so join them into marked text and append it after the user message.
 function buildContextText(msg) {
   const parts = [];
   const ctx = msg.userInputMessageContext;
@@ -645,7 +645,7 @@ function buildAnthropicRequest(req) {
     if (item?.userInputMessage) {
       const uim = item.userInputMessage;
       const blocks = [];
-      // 工具结果必须排在这轮用户消息最前面，Anthropic 要求它紧跟对应的 tool_use。
+      // Tool results must come first in this turn's user message; Anthropic requires them to immediately follow the matching tool_use.
       for (const tr of uim.userInputMessageContext?.toolResults || []) {
         blocks.push({ type: "tool_result", tool_use_id: tr.toolUseId, content: toolResultToText(tr.content) });
       }
@@ -662,13 +662,13 @@ function buildAnthropicRequest(req) {
         });
       }
       if (blocks.length) {
-        // 只有一个纯文本块时用字符串形式，省掉一层嵌套，兼容性更好。
+        // When there is only one plain-text block, use the string form, skipping a layer of nesting, for better compatibility.
         messages.push({
           role: "user",
           content: blocks.length === 1 && blocks[0].type === "text" ? blocks[0].text : blocks,
         });
       }
-      // 工具规格每轮都会重发一份，取到就覆盖，最后留下的是最新的那份。
+      // The tool spec is resent every turn; overwrite it whenever one arrives, so what remains is the latest copy.
       if (uim.userInputMessageContext?.tools) {
         tools = uim.userInputMessageContext.tools.map((spec) => {
           const { name, description, schema } = parseToolSpec(spec);
@@ -688,7 +688,7 @@ function buildAnthropicRequest(req) {
       for (const tu of arm.toolUses || []) {
         blocks.push({ type: "tool_use", id: tu.toolUseId, name: tu.name, input: parseToolInput(tu.input) });
       }
-      // 助手消息不能是空的，占位一下免得上游拒收整条对话。
+      // An assistant message cannot be empty; put in a placeholder so the upstream does not reject the whole conversation.
       if (!blocks.length) blocks.push({ type: "text", text: "(no content)" });
       messages.push({
         role: "assistant",
@@ -703,7 +703,7 @@ function buildAnthropicRequest(req) {
   const body = { model, messages, max_tokens: maxTokens, stream: true };
   if (tools && tools.length) body.tools = tools;
 
-  // 思考模式：模型名里带 thinking 的默认按开启处理，除非用户明确关掉。
+  // Thinking mode: a model whose name contains thinking is treated as enabled by default, unless the user explicitly turns it off.
   let thinkCfg = thinkingConfig();
   if (/thinking/i.test(model) && thinkCfg.type !== "disabled") {
     thinkCfg = { type: "enabled", budget_tokens: thinkingBudget() };
@@ -728,7 +728,7 @@ function thinkingBudget() {
   return Number.isFinite(n) && n > 0 ? n : 8192;
 }
 
-// 思考预算必须给正文留出余量，否则上游会因为 budget >= max_tokens 直接报错。
+// The thinking budget must leave margin for the body text, or the upstream errors immediately because budget >= max_tokens.
 function setThinkingBudget(body, budget) {
   if (!budget || budget <= 0) return;
   const b = Math.min(budget, body.max_tokens - 4096);
@@ -739,15 +739,15 @@ function isAnthropicModel(model) {
   return /claude|anthropic/i.test(String(model || ""));
 }
 
-// 提示词缓存断点：让中转站复用重复的对话前缀。cache_control 是 Anthropic 专有
-// 字段，非 Claude 模型默认跳过，免得中转站因为不认识这个字段整条请求报错。
+// Prompt-cache breakpoints: let the relay reuse a repeated conversation prefix. cache_control is an Anthropic-specific
+// field; skip it by default for non-Claude models so a relay that does not recognize the field does not fail the whole request.
 function applyCacheBreakpoints(body) {
   const mode = String(prefs().promptCaching || "auto");
   if (mode === "off") return;
   if (mode === "auto" && !isAnthropicModel(body.model)) return;
 
   const cc = () => ({ type: "ephemeral" });
-  const MAX = 4; // Anthropic 每请求最多 4 个断点
+  const MAX = 4; // Anthropic allows at most 4 breakpoints per request
   let used = 0;
 
   if (body.tools && body.tools.length && used < MAX) {
@@ -772,11 +772,11 @@ function applyCacheBreakpoints(body) {
     return false;
   };
 
-  // 第一条用户消息：系统提示词那一段，整场对话都不变，最值得缓存。
+  // The first user message: the system-prompt portion, unchanged for the whole conversation, and the most worth caching.
   const firstUser = msgs.findIndex((m) => m.role === "user");
   if (firstUser >= 0 && used < MAX && mark(firstUser)) used++;
 
-  // 倒数第二条用户消息：让上一轮的对话前缀也能命中。
+  // The second-to-last user message: so the previous turn's conversation prefix can hit the cache too.
   const userIdx = [];
   for (let i = 0; i < msgs.length; i++) if (msgs[i].role === "user") userIdx.push(i);
   if (userIdx.length >= 3 && used < MAX) {
@@ -785,8 +785,8 @@ function applyCacheBreakpoints(body) {
   }
 }
 
-// 把 Kiro 的档位落到请求上。三种落法：中转站自己有档位变体模型就换模型名；
-// 否则折算成思考预算；modelVariant 模式下退而求其次用 -thinking 变体。
+// Apply Kiro's effort level to the request. Three ways to land it: if the relay itself has an effort-variant model, change the model name;
+// otherwise convert it into a thinking budget; in modelVariant mode, fall back to the -thinking variant.
 function applyEffort(body, effort) {
   if (!effort) return;
   const mode = getEffortMode();
@@ -807,38 +807,38 @@ function applyEffort(body, effort) {
       return;
     }
   }
-  // auto 模式走到这里说明中转站没有对应的档位变体：只把 output_config 原样带上，
-  // 由中转站自己决定怎么处理。不强行改成思考预算 —— 对不支持 thinking 的模型来说
-  // 那会直接把请求打回来。想要确定性的行为就把 effortMode 显式设成 thinkingBudget。
+  // Reaching here in auto mode means the relay has no matching effort variant: pass output_config through as-is,
+  // and let the relay decide how to handle it. Do not force it into a thinking budget -- for a model that does not support thinking,
+  // that would bounce the request straight back. For deterministic behavior, set effortMode explicitly to thinkingBudget.
   if (mode === "thinkingBudget") {
     setThinkingBudget(body, budgetForEffort(effort));
   }
 }
 
 // ---------------------------------------------------------------------------
-// 流转换器：Anthropic SSE → CodeWhisperer 事件
+// Stream converter: Anthropic SSE → CodeWhisperer events
 //
-// 上游一行一个 "data: {...}"，事件序列大致是：
+// The upstream sends one "data: {...}" per line. The event sequence is roughly:
 //   message_start → (content_block_start → content_block_delta* →
 //   content_block_stop)* → message_delta → message_stop
-// 每种 delta 对应 Kiro 的一种事件：正文走 assistantResponseEvent，思考走
-// reasoningContentEvent，工具调用要攒齐入参再一次性发 toolUseEvent。
+// Each kind of delta maps to one Kiro event: body text goes out as assistantResponseEvent, thinking as
+// reasoningContentEvent, and tool calls must accumulate their input and then send toolUseEvent all at once.
 // ---------------------------------------------------------------------------
 const FALLBACK_CONTEXT_WINDOW = 200000;
 
-// 上下文窗口：中转站报了就用它的，没报只能按模型名猜。
+// Context window: use the relay's value if it reported one; otherwise the only option is to guess from the model name.
 //
-// 猜的时候必须往小猜。这个值是分母，猜大了算出来的占用比例就偏小 —— 比如真实
-// 占用 100K/200K（50%），窗口猜成 1000000 就变成 10%，Kiro 以为还很空，不触发
-// 压缩，接着往里塞，直到上游直接报超长。宁可高估占用让它早点压缩，代价只是压缩
-// 得勤一点；低估的代价是这轮对话直接崩。
-// 所以只有中转站明确上报窗口时才敢用大值，"auto"这种根本不知道会路由到哪个模型
-// 的一律按保守窗口算。
+// When guessing, guess low. This value is the denominator; guessing high makes the computed occupancy ratio too small -- for example a real
+// occupancy of 100K/200K (50%) becomes 10% if the window is guessed as 1000000. Kiro thinks it is still quite empty and does not trigger
+// compression, then keeps stuffing more in until the upstream reports the context is over-length. Prefer overestimating occupancy so it compresses earlier; the only cost is compressing
+// a bit more often. Underestimating means this conversation crashes outright.
+// So a large value is used only when the relay explicitly reports the window. Something like "auto", where there is no way to know which model it will route to,
+// is always computed with the conservative window.
 function contextWindowForModelId(modelId) {
   const fromRelay = contextWindowForModel(modelId);
   if (fromRelay > 0) return fromRelay;
   const m = String(modelId || "").toLowerCase();
-  // 只有型号里明确写了大窗口世代，才按大窗口算；auto 不在其中。
+  // Use the large window only when the model name explicitly names a large-window generation; auto is not one of those.
   if (/(opus|sonnet)-4[.-](6|7|8)/.test(m) || /sonnet-5|fable[.-]?5/.test(m)) {
     return 1000000;
   }
@@ -869,7 +869,7 @@ class AnthropicStreamConverter {
     this.usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
   }
 
-  // 处理一行 SSE。返回 0 个或多个待写出的事件。
+  // Handle one SSE line. Returns zero or more events waiting to be written.
   processLine(line) {
     if (!line.startsWith("data:")) return [];
     const payload = line.slice(line.indexOf(":") + 1).trim();
@@ -889,13 +889,13 @@ class AnthropicStreamConverter {
       const u = ev.message?.usage;
       if (u) {
         this.captureUsage(u);
-        // 缓存读取和缓存写入的 token 也占上下文，得一起算进去。
+        // Cache-read and cache-write tokens also occupy context, so they have to be counted in together.
         const total = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
         this.startInputTokens = total;
-        // 立刻下发，不要攒到 flush()。上下文占用讲的是"输入占了多少"，message_start
-        // 这会儿这个数字就已经定了，没有等下去的理由；而攒到最后一刻的话，流一旦
-        // 被中断（换号重发、上游报错），这一轮的百分比就丢了，Kiro 那个圆圈会一直
-        // 停在旧值上，几轮下来越偏越多，等它反应过来上下文已经爆了。
+        // Emit immediately; do not hold it until flush(). Context occupancy means "how much of the input is used", and at message_start
+        // that number is already fixed, so there is no reason to keep waiting. If it is held until the last moment, once the stream
+        // is interrupted (account switch and resend, or an upstream error), this turn's percentage is lost, and Kiro's circle stays
+        // stuck on the old value. Over several turns it drifts further and further, and by the time it catches up the context has already overflowed.
         out.push(...this.emitContextPct(contextUsagePercent(total, this.modelId)));
       }
       return out;
@@ -923,7 +923,7 @@ class AnthropicStreamConverter {
       } else if (d?.type === "thinking_delta" && d.thinking) {
         out.push({ reasoningContentEvent: { text: d.thinking } });
       } else if (d?.type === "signature_delta" && d.signature) {
-        // 签名是分片来的，攒齐了在 block_stop 时一次性发出去。
+        // The signature arrives in fragments; once it is accumulated, send it all at once at block_stop.
         this.curSignature += d.signature;
       } else if (d?.type === "input_json_delta" && d.partial_json) {
         this.currentToolInput += d.partial_json;
@@ -955,15 +955,15 @@ class AnthropicStreamConverter {
 
     if (ev.type === "message_delta" && ev.usage) {
       this.captureUsage(ev.usage);
-      // 有些中转站会直接把上下文占用比例算好给我们。它知道真实的窗口大小，比我们
-      // 按模型名猜的准，所以拿到就立刻下发覆盖掉先前那个估算值。
+      // Some relays compute the context-occupancy percentage for us. They know the real window size, which is more accurate than
+      // our guess from the model name, so emit it immediately and overwrite the earlier estimate.
       const relayPct = ev.usage.contextUsagePercentage;
       if (typeof relayPct === "number" && relayPct >= 0) {
         out.push(...this.emitContextPct(relayPct));
       }
-      // 用合并后的累计 usage 来算，而不是只看这一条 message_delta：上游常常在
-      // message_start 里报完整的输入构成（含缓存读取/写入），到 message_delta 只
-      // 补一个 output_tokens。只认当前这条会把缓存那部分丢掉，输入 token 就偏小了。
+      // Compute from the merged cumulative usage, not from this message_delta alone: the upstream often reports the full input breakdown
+      // (including cache read/write) in message_start, and at message_delta only
+      // adds an output_tokens. Trusting only the current event drops the cache portion, and the input token count comes out too small.
       const inTokens = this.usage.inputTokens + this.usage.cacheReadTokens + this.usage.cacheCreationTokens;
       out.push({
         metadataEvent: {
@@ -984,8 +984,8 @@ class AnthropicStreamConverter {
     if (typeof u.cache_creation_input_tokens === "number") this.usage.cacheCreationTokens = u.cache_creation_input_tokens;
   }
 
-  // 下发一次上下文占用（Kiro 顶部那个百分比圆圈就是拿它画的）。
-  // 值跟上次发的一样就不重发，省掉无意义的帧；不一样就发，后来的更准。
+  // Emit context occupancy once (the percentage circle at the top of Kiro is drawn from this).
+  // If the value matches the last one sent, do not resend, saving a meaningless frame; if it differs, send it, since the later one is more accurate.
   emitContextPct(pct) {
     if (pct === null || pct === undefined || !Number.isFinite(pct)) return [];
     const v = Math.max(0, Math.min(100, pct));
@@ -995,7 +995,7 @@ class AnthropicStreamConverter {
     return [{ contextUsageEvent: { contextUsagePercentage: v } }];
   }
 
-  // 收尾：补上没闭合的工具调用和上下文占用条。
+  // Wrap-up: fill in any unclosed tool call and the context-occupancy bar.
   flush() {
     const out = [];
     if (this.inToolUse) {
@@ -1008,7 +1008,7 @@ class AnthropicStreamConverter {
       });
       this.inToolUse = false;
     }
-    // 兜底：整轮下来一次都没发出去过（上游压根没报 usage），最后补一发。
+    // Fallback: if nothing was sent for the whole turn (the upstream never reported usage at all), send one at the end.
     if (this.sentContextPct === null && this.pendingContextPct !== null) {
       out.push(...this.emitContextPct(this.pendingContextPct));
     }
@@ -1017,10 +1017,10 @@ class AnthropicStreamConverter {
 }
 
 // ---------------------------------------------------------------------------
-// 意图分类拦截
+// Intent-classification intercept
 //
-// Kiro 每轮对话前会先发一条"你是意图分类器，判断这是 chat/do/spec"的请求。这条
-// 请求对用户不可见，却要花一次真实调用。本地按关键词判一下直接回，省掉这一次。
+// Before each conversation turn, Kiro first sends a "you are an intent classifier; decide whether this is chat/do/spec" request. This
+// request is invisible to the user but costs one real call. Judge it locally by keywords and reply directly, saving that call.
 // ---------------------------------------------------------------------------
 const CLASSIFIER_SIGN_A = "You are an intent classifier for a language model";
 const CLASSIFIER_SIGN_B = "(chat, do, spec)";
@@ -1055,7 +1055,7 @@ const SPEC_HINTS = [
 ];
 
 function classifyIntent(prompt) {
-  // 分类器的提示词很长，真正要判断的用户原话在这个标记之后。
+  // The classifier prompt is very long; the user's actual words to judge come after this marker.
   const marker = "Here is the last user message:";
   const idx = prompt.lastIndexOf(marker);
   const tail = idx >= 0 ? prompt.slice(idx + marker.length) : prompt;
@@ -1073,10 +1073,10 @@ function buildIntentClassifierResponse(req, convId, modelId) {
 }
 
 // ---------------------------------------------------------------------------
-// CPS：模型清单
+// CPS: model list
 //
-// Kiro 的模型下拉框来自 ListAvailableModels。这里把中转站的 /v1/models 结果翻译
-// 成 Kiro 认的结构，并按需附上档位选择的 schema。
+// Kiro's model dropdown comes from ListAvailableModels. Here the relay's /v1/models result is translated
+// into the structure Kiro recognizes, and an effort-selection schema is attached when needed.
 // ---------------------------------------------------------------------------
 async function buildCpsModelList() {
   const relay = await fetchRelayModels(false);
@@ -1101,7 +1101,7 @@ async function buildCpsModelList() {
       },
     };
 
-    // 档位来源三选一：中转站原生声明 > 模型变体推断 > 全量给上。
+    // Effort source, one of three, in priority order: the relay's native declaration > inferred from model variants > supply the full set.
     let efforts = [];
     let schemaPath = "output_config";
     if (g.nativeEffortLevels && g.nativeEffortLevels.length) {
@@ -1135,8 +1135,8 @@ async function buildCpsModelList() {
   return result;
 }
 
-// 假的 profile：Kiro 启动时会问一次，不给它会卡在初始化。中转站模式下没有真实
-// 的 AWS 账号概念，回一个结构合法的占位就行。
+// A fake profile: Kiro asks once at startup, and without an answer it gets stuck initializing. Relay mode has no real
+// AWS-account concept; a structurally valid placeholder is enough.
 function fakeProfile() {
   return {
     arn: "arn:aws:codewhisperer:us-east-1:000000000000:profile/KIROAPIKEYIDE",
@@ -1145,7 +1145,7 @@ function fakeProfile() {
   };
 }
 
-// 把 x-amz-target 头和 URL 路径揉成一个便于匹配的小写串。
+// Fold the x-amz-target header and the URL path into one lowercase string that is easy to match.
 function opProbe(req, urlPath) {
   const target = String(req.headers["x-amz-target"] || req.headers["x-amzn-target"] || "");
   const op = (target.split(".").pop() || "").replace(/[^a-z0-9]/gi, "").toLowerCase();
@@ -1154,19 +1154,19 @@ function opProbe(req, urlPath) {
 }
 
 // ---------------------------------------------------------------------------
-// KRS：生成请求的翻译转发
+// KRS: translate and forward generation requests
 // ---------------------------------------------------------------------------
 function beginEventStream(res) {
   res.writeHead(200, {
     "Content-Type": EVENT_STREAM_CONTENT_TYPE,
     "Transfer-Encoding": "chunked",
   });
-  // 关掉 Nagle：不然小的增量帧会被攒着发，用户会觉得回答一顿一顿的。
+  // Turn off Nagle: otherwise small incremental frames get buffered before sending, and the reply feels stuttery.
   try { res.socket?.setNoDelay(true); } catch {}
 }
 
-// 把一段话当成助手的正常回答发出去。用来提示"还没配置"这类情况 —— 比抛错好，
-// 用户在对话框里直接就能看懂该去做什么。
+// Send a passage of text as a normal assistant reply. Used for cases like "not configured yet" -- better than throwing,
+// because the user can see what to do directly in the chat box.
 function writeSetupMessage(res, convId, msg) {
   beginEventStream(res);
   writeEvent(res, { messageMetadataEvent: { conversationId: convId } });
@@ -1228,8 +1228,8 @@ function makeRelayKrsHandler() {
   };
 }
 
-// 本该走 CPS 的管理类调用有时会落到 KRS（不同 Kiro 版本对通用回退端点的解析不
-// 一样）。就地应答，别让模型列表变空。
+// Management calls that should go to CPS sometimes land on KRS (different Kiro versions resolve the generic fallback endpoint
+// differently). Answer them in place so the model list does not go empty.
 function looksLikeManagementCall(req, urlPath) {
   const { probe } = opProbe(req, urlPath);
   return probe.includes("availablemodels") || probe.includes("profile") || probe.includes("usagelimit");
@@ -1259,9 +1259,9 @@ async function handleManagementCall(req, res, urlPath) {
   res.end("{}");
 }
 
-// Kiro 会向 runtime 端点发 InvokeMCPCommand 探测「服务端托管的 MCP 工具」。中转站
-// 没有这种东西，但回 {} 不是合法 JSON-RPC，会让 Kiro 的工具发现流程失败、看起来
-// 像是工具都没了。回一个合法的「没有远程工具」结果，本地工具不受影响。
+// Kiro sends InvokeMCPCommand to the runtime endpoint to probe for "server-hosted MCP tools". The relay
+// has nothing like that, but returning {} is not valid JSON-RPC and makes Kiro's tool-discovery flow fail, which looks
+// as if the tools are all gone. Return a valid "no remote tools" result; local tools are unaffected.
 function handleMcpJsonRpc(res, rawBody) {
   let id = null;
   let rpcMethod = "";
@@ -1272,7 +1272,7 @@ function handleMcpJsonRpc(res, rawBody) {
   } catch {}
   log("[中转站/KRS] MCP: " + (rpcMethod || "(无法解析)"));
 
-  // 没有 id 的是通知（notification），按协议不需要回结果。
+  // A message with no id is a notification; the protocol does not require a result in return.
   if (id === null || id === undefined) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end("");
@@ -1299,7 +1299,7 @@ function handleMcpJsonRpc(res, rawBody) {
 }
 
 async function handleGenerate(req, res, bodyBuf) {
-  // 固定前置/后置提示词在翻译之前注入，这样它跟官方直连模式的行为一致。
+  // Fixed prefix/suffix prompts are injected before translation, so the behavior matches official direct mode.
   const injected = host.applyPromptPrefs(bodyBuf);
   if (injected.applied) {
     bodyBuf = injected.buf;
@@ -1328,7 +1328,7 @@ async function handleGenerate(req, res, bodyBuf) {
     return;
   }
 
-  // 意图分类：本地判掉，省一次上游调用。
+  // Intent classification: judge it locally and save one upstream call.
   if (prefs().interceptIntentClassifier !== false && isIntentClassifierRequest(parsed)) {
     log("[中转站/KRS] 本地应答意图分类请求 conv=" + convId);
     beginEventStream(res);
@@ -1344,7 +1344,7 @@ async function handleGenerate(req, res, bodyBuf) {
   const payload = JSON.stringify(anthropicBody);
   const targetUrl = resolveApiUrl("/messages");
 
-  // 统计沿用官方直连那一套：请求数、输入输出量、失败数在面板上是同一组数字。
+  // Stats follow the same scheme as official direct mode: request count, input/output volume, and failure count are the same set of numbers on the panel.
   host.stats.requestStarted(payload.length, "");
   let statEnded = false;
   const endOnce = (ok) => {
@@ -1357,7 +1357,7 @@ async function handleGenerate(req, res, bodyBuf) {
   const headers = {
     "content-type": "application/json",
     "x-api-key": relayApiKey(),
-    // 有的中转站只认 OpenAI 风格的 Authorization，两个都带上最省事。
+    // Some relays only accept OpenAI-style Authorization; sending both is the least trouble.
     authorization: "Bearer " + relayApiKey(),
     "anthropic-version": "2023-06-01",
     accept: "text/event-stream",
@@ -1374,7 +1374,7 @@ async function handleGenerate(req, res, bodyBuf) {
     const msg = e?.message || String(e);
     log("!! [中转站/KRS] 连接失败: " + msg);
     endOnce(false);
-    // 用助手回答的形式把错误说清楚，比一个红色的 500 更有用。
+    // Explain the error as an assistant reply; that is more useful than a red 500.
     beginEventStream(res);
     writeEvent(res, { messageMetadataEvent: { conversationId: convId } });
     writeEvent(res, {
@@ -1406,7 +1406,7 @@ async function handleGenerate(req, res, bodyBuf) {
   await pumpStream(res, upstream.body, convId, upstreamModel, endOnce);
 }
 
-// 边读上游 SSE 边转边写，全程不落盘不攒整段，用户看到的是逐字输出。
+// Read the upstream SSE, translate, and write as it arrives. Nothing is written to disk and the whole body is never buffered, so the user sees character-by-character output.
 function pumpStream(res, body, convId, modelId, endOnce) {
   return new Promise((resolve) => {
     const converter = new AnthropicStreamConverter(convId, modelId);
@@ -1431,13 +1431,13 @@ function pumpStream(res, body, convId, modelId, endOnce) {
           res.end();
         }
       } catch {}
-      // 输出量按真实回传字节记，跟官方直连模式的口径保持一致。
+      // Output volume is recorded from the bytes actually sent back, matching the accounting used by official direct mode.
       if (outBytes) host.stats.addOutBytes(outBytes, "");
       endOnce(true);
       resolve();
     };
 
-    // 用户点了停止 / 重载窗口：上游连接要立刻掐掉，不然中转站还在计费。
+    // The user clicked stop / reloaded the window: cut the upstream connection immediately, or the relay keeps charging.
     const onClientClose = () => {
       clientClosed = true;
       try { body.destroy(); } catch {}
@@ -1478,7 +1478,7 @@ function pumpStream(res, body, convId, modelId, endOnce) {
 }
 
 // ---------------------------------------------------------------------------
-// CPS：控制面
+// CPS: control plane
 // ---------------------------------------------------------------------------
 function makeRelayCpsHandler() {
   return function handle(req, res) {
@@ -1488,7 +1488,7 @@ function makeRelayCpsHandler() {
       res.end(host.healthMarker);
       return;
     }
-    req.resume(); // 控制面请求的 body 用不上，读掉免得连接挂住
+    req.resume(); // The control-plane request body is unused; drain it so the connection does not hang
     if (!host.isEnabled()) {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end("{}");
@@ -1521,7 +1521,7 @@ function makeRelayCpsHandler() {
       return;
     }
     if (probe.includes("usagelimit")) {
-      // 中转站没有 Kiro 的额度概念，回空对象即可，Kiro 会把额度条隐藏掉。
+      // The relay has no Kiro quota concept; an empty object is enough, and Kiro hides the quota bar.
       res.writeHead(200, { "Content-Type": contentType });
       res.end("{}");
       return;
@@ -1533,14 +1533,14 @@ function makeRelayCpsHandler() {
 }
 
 // ---------------------------------------------------------------------------
-// 用量查询
+// Usage lookup
 //
-// 中转站的用量接口没有统一标准，常见的几种流派逐个探测，命中即用，并把探测结果
-// 缓存起来（下次直接问对的那个，不再挨个试）。
+// Relay usage APIs have no single standard. Probe the common styles one by one, use the first hit, and cache
+// the probe result (next time ask that one directly instead of trying each).
 // ---------------------------------------------------------------------------
 const USAGE_SOURCE_TTL_MS = 30 * 60 * 1000;
-const NEWAPI_QUOTA_DIVISOR = 500000; // New-API 的 quota 单位 → 美元
-let _usageSource = "";               // 上次命中的流派
+const NEWAPI_QUOTA_DIVISOR = 500000; // New-API quota units → US dollars
+let _usageSource = "";               // Style that hit last time
 let _usageSourceAt = 0;
 
 function usageSourceCached() {
@@ -1566,7 +1566,7 @@ const USAGE_SOURCE_LABEL = {
   billing: "OpenAI 兼容计费接口",
 };
 
-// KiroTool 风格：/api/pub/quota，带请求明细，能顺手算出缓存命中率。
+// KiroTool style: /api/pub/quota, includes per-request details, and the cache hit rate can be computed along the way.
 async function tryPubQuota() {
   const key = relayApiKey();
   const data = await getJson(resolveRootUrl("/api/pub/quota"), { Authorization: "Bearer " + key });
@@ -1588,7 +1588,7 @@ async function tryPubQuota() {
     const credits = Number(row.credits) || 0;
     totalInput += inTok;
     totalOutput += outTok;
-    // 缓存写入的字段名各家不一样，挨着试一遍，没有就算 0。
+    // Cache-write field names differ by vendor; try them in turn, and if none is present count it as 0.
     totalCacheWrite += Number(row.cache_creation_tokens)
       || Number(row.cache_write_tokens)
       || Number(row.cache_creation_input_tokens)
@@ -1605,18 +1605,18 @@ async function tryPubQuota() {
     modelMap.set(model, cur);
   }
 
-  // 命中率 = 缓存读取 / 总输入。分母怎么取要看上游的 prompt_tokens 有没有把缓存
-  // 读取算进去，两种口径都存在，猜错的后果很直观：
-  //   已经算进去了却又加一遍 → 命中率被砍掉一半（99% 显示成 50%）
-  //   没算进去却不加         → 命中率超过 100%
-  // 所以按"缓存读取有没有超过总输入"反推：超过说明是分开记的，那就相加。
+  // Hit rate = cache reads / total input. Which denominator to use depends on whether the upstream prompt_tokens already includes cache
+  // reads. Both conventions exist, and guessing wrong has an obvious effect:
+  //   already included but added again → hit rate is cut in half (99% shows as 50%)
+  //   not included and not added       → hit rate exceeds 100%
+  // So infer from "whether cache reads exceed total input": if they do, the two were recorded separately, so add them.
   const cacheDenom = totalCacheRead > totalInput ? totalInput + totalCacheRead : totalInput;
   const cache = cacheRecords > 0
     ? {
         records: cacheRecords,
         cacheReadTokens: totalCacheRead,
         cacheWriteTokens: totalCacheWrite,
-        // 分母一起带出去，面板要把它显示成「总输入 token」，口径必须跟命中率一致。
+        // Carry the denominator out as well. The panel displays it as "total input tokens", so the accounting must match the hit rate.
         denomTokens: cacheDenom,
         hitRate: cacheDenom > 0 ? Math.min(1, totalCacheRead / cacheDenom) : null,
       }
@@ -1640,7 +1640,7 @@ async function tryPubQuota() {
   };
 }
 
-// New-API / One-API 风格：/api/user/self，注意 Authorization 不带 Bearer 前缀。
+// New-API / One-API style: /api/user/self. Note that Authorization does not include a Bearer prefix.
 async function tryNewApi() {
   const key = relayApiKey();
   const data = await getJson(resolveRootUrl("/api/user/self"), { Authorization: key });
@@ -1665,7 +1665,7 @@ async function tryNewApi() {
   };
 }
 
-// kiro2cc-proxy 风格：/api/user/usage，字段名就是驼峰的那一套。
+// kiro2cc-proxy style: /api/user/usage. The field names are the camelCase set.
 async function tryKiro2cc() {
   const key = relayApiKey();
   const data = await getJson(resolveRootUrl("/api/user/usage"), { "x-api-key": key });
@@ -1695,7 +1695,7 @@ async function tryKiro2cc() {
   };
 }
 
-// OpenAI 兼容计费接口：订阅额度 + 累计消费，通用兜底。
+// OpenAI-compatible billing API: subscription quota plus cumulative spend. A generic fallback.
 async function tryBilling() {
   const key = relayApiKey();
   const auth = { Authorization: "Bearer " + key };
@@ -1713,7 +1713,7 @@ async function tryBilling() {
     const end = ymd(new Date(Date.now() + 86400000));
     const usage = await getJson(
       resolveRootUrl("/v1/dashboard/billing/usage?start_date=2020-01-01&end_date=" + end), auth);
-    usedUsd = (Number(usage.total_usage) || 0) / 100; // 这个接口的单位是美分
+    usedUsd = (Number(usage.total_usage) || 0) / 100; // This API's unit is cents
   } catch {}
 
   return {
@@ -1744,7 +1744,7 @@ async function fetchRelayUsage(force = false) {
   }
   if (force) clearUsageSource();
 
-  // 上次命中过就先问它，省掉几次无谓的探测往返。
+  // If the last probe hit, ask that one first and skip a few pointless probe round trips.
   const cached = usageSourceCached();
   const order = cached
     ? [cached, ...USAGE_PROBE_ORDER.filter((s) => s !== cached)]
@@ -1786,7 +1786,7 @@ function shortErr(e) {
 }
 
 // ---------------------------------------------------------------------------
-// 连通性测试：面板上那个「测试连接」按钮。只拉模型列表，不发生成请求，不花钱。
+// Connectivity test: the "Test connection" button on the panel. It only fetches the model list, sends no generation request, and costs nothing.
 // ---------------------------------------------------------------------------
 async function testRelayConnection() {
   const base = baseUrlRaw();
@@ -1814,7 +1814,7 @@ async function testRelayConnection() {
         return { ok: false, status: res.statusCode, ms, message: "模型列表无法解析：" + shortErr(e) };
       }
       if (models.length) {
-        // 顺手把这次结果当缓存用上，紧接着的模型下拉框就不用再拉一次。
+        // Use this result as the cache while we're here, so the model dropdown right after does not have to fetch again.
         _modelCache = models;
         _modelCacheAt = Date.now();
         _modelAuthStyle = style;
@@ -1838,7 +1838,7 @@ async function testRelayConnection() {
   return { ok: false, ms: Date.now() - started, message: lastErr || "连接失败" };
 }
 
-// 面板要展示的中转站概况。
+// Relay overview for the panel to display.
 function relaySnapshot() {
   return {
     configured: relayConfigured(),
@@ -1849,7 +1849,7 @@ function relaySnapshot() {
   };
 }
 
-// 配置变了（地址 / Key）就把缓存全部作废，免得拿着上一个站点的数据显示。
+// When the config changes (address / key), invalidate every cache so data from the previous site is not shown.
 function invalidateRelayCaches() {
   clearModelCache();
   clearUsageSource();
@@ -1859,10 +1859,10 @@ function invalidateRelayCaches() {
 
 module.exports = {
   init,
-  // 处理器
+  // Handlers
   makeRelayKrsHandler,
   makeRelayCpsHandler,
-  // 面板用
+  // For the panel
   testRelayConnection,
   fetchRelayUsage,
   fetchRelayModels,
@@ -1870,7 +1870,7 @@ module.exports = {
   relaySnapshot,
   relayConfigured,
   invalidateRelayCaches,
-  // 单测 / 排查用
+  // For unit tests / troubleshooting
   buildAnthropicRequest,
   AnthropicStreamConverter,
   encodeEvent,
