@@ -552,13 +552,11 @@ function conversationIdOf(req) {
   return req?.conversationState?.conversationId || "unknown";
 }
 
-// Kiro internal model ID → relay model ID. Check the user's mapping table first, then the fallback model; if neither is set, pass it through as-is
-// (many relays accept Kiro IDs directly).
+// Kiro internal model ID → relay model ID. A mapping entry wins. Otherwise the id Kiro sent is forwarded unchanged,
+// so the model picked in chat is the one the relay calls.
 function resolveModel(kiroModelId) {
   const mapping = prefs().modelMapping || {};
   if (mapping[kiroModelId]) return String(mapping[kiroModelId]);
-  const def = String(prefs().defaultModel || "").trim();
-  if (def) return def;
   return kiroModelId;
 }
 

@@ -604,7 +604,6 @@ function relayPrefs() {
     thinkingBudget: get("relayThinkingBudget", 8192),
     effortMode: get("relayEffortMode", "auto"),
     effortBudgets: get("relayEffortBudgets", {}),
-    defaultModel: get("relayDefaultModel", ""),
     modelMapping: get("relayModelMapping", {}),
     interceptIntentClassifier: get("relayInterceptIntentClassifier", true),
     promptCaching: get("relayPromptCaching", "auto"),
@@ -6699,7 +6698,6 @@ class ControlPanelProvider {
           thinkingBudget: "relayThinkingBudget",
           effortMode: "relayEffortMode",
           effortBudgets: "relayEffortBudgets",
-          defaultModel: "relayDefaultModel",
           modelMapping: "relayModelMapping",
           interceptIntentClassifier: "relayInterceptIntentClassifier",
           promptCaching: "relayPromptCaching",
@@ -6708,7 +6706,7 @@ class ControlPanelProvider {
         for (const [field, confKey] of Object.entries(FIELDS)) {
           if (!(field in patch)) continue;
           let v = patch[field];
-          if (field === "baseUrl" || field === "apiKey" || field === "defaultModel") v = String(v || "").trim();
+          if (field === "baseUrl" || field === "apiKey") v = String(v || "").trim();
           if (field === "maxTokens" || field === "thinkingBudget") v = Number(v) || 0;
           if (field === "interceptIntentClassifier") v = !!v;
           if ((field === "baseUrl" || field === "apiKey") && v !== get(confKey, "")) credsChanged = true;
@@ -7488,6 +7486,20 @@ async function activate(context) {
     },
   });
   try { await migrateLegacyKey(); } catch (e) { log("migrateLegacyKey failed: " + (e?.message || e)); }
+  // The fallback-model setting overrode the model chosen in chat. Drop any value saved by older versions.
+  try {
+    const cfgInspect = cfg().inspect("relayDefaultModel");
+    const targets = [];
+    if (cfgInspect && cfgInspect.globalValue !== undefined) targets.push(vscode.ConfigurationTarget.Global);
+    if (cfgInspect && cfgInspect.workspaceValue !== undefined) targets.push(vscode.ConfigurationTarget.Workspace);
+    if (cfgInspect && cfgInspect.workspaceFolderValue !== undefined) targets.push(vscode.ConfigurationTarget.WorkspaceFolder);
+    for (const target of targets) {
+      try { await cfg().update("relayDefaultModel", undefined, target); } catch (e) {
+        log("clear relayDefaultModel failed: " + (e?.message || e));
+      }
+    }
+    if (targets.length) log("已去掉兜底模型设置，聊天里选的模型会原样发给中转站");
+  } catch (e) { log("clear relayDefaultModel failed: " + (e?.message || e)); }
   // Backfill an add-time for keys that already exist: keys added before the upgrade to this version, and keys the user stuffed in by editing the config
   // directly, all receive their first timestamp here.
   try { await syncKeyAddedAt(); } catch (e) { log("syncKeyAddedAt failed: " + (e?.message || e)); }
@@ -7601,7 +7613,7 @@ async function activate(context) {
         "mode", "relayBaseUrl", "relayApiKey", "relayPorts"].some(hit);
       // Config items that only affect translation behavior do not need the server rebound. Refreshing the panel is enough.
       const relayTweaked = ["relayMaxTokens", "relayThinking", "relayThinkingBudget",
-        "relayEffortMode", "relayEffortBudgets", "relayDefaultModel", "relayModelMapping",
+        "relayEffortMode", "relayEffortBudgets", "relayModelMapping",
         "relayInterceptIntentClassifier", "relayPromptCaching"].some(hit);
       if (!needsApply && !relayTweaked) return;
       // A key added by editing the config directly needs an add-time too.

@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.6 — 2026-11-03
+
+The relay fallback-model field is gone. It was replacing the model selected in chat, so a Haiku turn still went out as whatever id was filled in there. The model id Kiro sends is now forwarded as-is, unless `kiroGateway.relayModelMapping` has an entry for it. A saved fallback value is cleared on startup. The panel footer still shows `2026-11-03`.
+
 ## 2.0.5 — 2026-11-03
 
 Relay mode now tells Kiro when a reply has finished. Anthropic `stop_reason` is forwarded as `metadataEvent.stopReason` (`END_TURN`, `MAX_TOKENS`, `TOOL_USE`, and the other reasons Kiro already understands). A completed relay answer is no longer treated as truncated, so Kiro does not retry that turn or append a `Continue` user message. The panel footer still shows `2026-11-03`.
