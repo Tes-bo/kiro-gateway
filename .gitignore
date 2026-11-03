@@ -1,0 +1,10 @@
+.DS_Store
+node_modules/
+*.vsix
+*.log
+.env
+.env.*
+b.json
+m.json
+*auth-token*.json
+*credentials*.json
