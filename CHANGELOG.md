@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.5 — 2026-11-03
+
+Relay mode now tells Kiro when a reply has finished. Anthropic `stop_reason` is forwarded as `metadataEvent.stopReason` (`END_TURN`, `MAX_TOKENS`, `TOOL_USE`, and the other reasons Kiro already understands). A completed relay answer is no longer treated as truncated, so Kiro does not retry that turn or append a `Continue` user message. The panel footer still shows `2026-11-03`.
+
 ## 2.0.4 — 2026-11-03
 
 The panel follows Kiro's language, with a Chinese / English switch at the top and a `kiroGateway.language` setting (`auto`, `zh`, `en`). The two buttons at the top only change the page. The route that is running stays until you confirm; confirming stops that route and reloads the window. Cancel leaves it running. Code comments in `extension.js` and `relay.js` are English.

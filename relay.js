@@ -852,6 +852,36 @@ function contextUsagePercent(tokens, modelId) {
   return Math.max(0, Math.min(100, (tokens / win) * 100));
 }
 
+// Kiro's converse client logs truncation_suspected unless metadataEvent.stopReason is set.
+// The names are the ones the client already switches on; it lowercases them later (MAX_TOKENS → max_tokens).
+const KIRO_STOP_BY_ANTHROPIC = {
+  end_turn: "END_TURN",
+  max_tokens: "MAX_TOKENS",
+  stop_sequence: "END_TURN",
+  tool_use: "TOOL_USE",
+  pause_turn: "PAUSE_TURN",
+  refusal: "CONTENT_FILTERED",
+};
+const KIRO_STOP_REASONS = new Set([
+  "END_TURN",
+  "MAX_TOKENS",
+  "TOOL_USE",
+  "PAUSE_TURN",
+  "CONTENT_FILTERED",
+  "MODEL_CONTEXT_WINDOW_EXCEEDED",
+  "UNKNOWN",
+]);
+
+function kiroStopReason(raw) {
+  if (typeof raw !== "string") return "";
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  const fromAnthropic = KIRO_STOP_BY_ANTHROPIC[trimmed.toLowerCase()];
+  if (fromAnthropic) return fromAnthropic;
+  const upper = trimmed.toUpperCase();
+  return KIRO_STOP_REASONS.has(upper) ? upper : "";
+}
+
 class AnthropicStreamConverter {
   constructor(conversationId, modelId) {
     this.conversationId = conversationId;
@@ -866,6 +896,9 @@ class AnthropicStreamConverter {
     this.pendingContextPct = null;
     this.sentContextPct = null;
     this.sawText = false;
+    this.sawTool = false;
+    this.sawReasoning = false;
+    this.stopSent = false;
     this.usage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
   }
 
@@ -905,6 +938,7 @@ class AnthropicStreamConverter {
       const block = ev.content_block;
       if (block?.type === "tool_use") {
         this.inToolUse = true;
+        this.sawTool = true;
         this.currentToolId = block.id || "";
         this.currentToolName = block.name || "";
         this.currentToolInput = "";
@@ -921,6 +955,7 @@ class AnthropicStreamConverter {
         this.sawText = true;
         out.push({ assistantResponseEvent: { content: d.text, modelId: this.modelId } });
       } else if (d?.type === "thinking_delta" && d.thinking) {
+        this.sawReasoning = true;
         out.push({ reasoningContentEvent: { text: d.thinking } });
       } else if (d?.type === "signature_delta" && d.signature) {
         // The signature arrives in fragments; once it is accumulated, send it all at once at block_stop.
@@ -953,25 +988,36 @@ class AnthropicStreamConverter {
       return out;
     }
 
-    if (ev.type === "message_delta" && ev.usage) {
-      this.captureUsage(ev.usage);
-      // Some relays compute the context-occupancy percentage for us. They know the real window size, which is more accurate than
-      // our guess from the model name, so emit it immediately and overwrite the earlier estimate.
-      const relayPct = ev.usage.contextUsagePercentage;
-      if (typeof relayPct === "number" && relayPct >= 0) {
-        out.push(...this.emitContextPct(relayPct));
+    if (ev.type === "message_delta") {
+      if (ev.usage) {
+        this.captureUsage(ev.usage);
+        // Some relays compute the context-occupancy percentage for us. They know the real window size, which is more accurate than
+        // our guess from the model name, so emit it immediately and overwrite the earlier estimate.
+        const relayPct = ev.usage.contextUsagePercentage;
+        if (typeof relayPct === "number" && relayPct >= 0) {
+          out.push(...this.emitContextPct(relayPct));
+        }
+        // Compute from the merged cumulative usage, not from this message_delta alone: the upstream often reports the full input breakdown
+        // (including cache read/write) in message_start, and at message_delta only
+        // adds an output_tokens. Trusting only the current event drops the cache portion, and the input token count comes out too small.
+        const inTokens = this.usage.inputTokens + this.usage.cacheReadTokens + this.usage.cacheCreationTokens;
+        out.push({
+          metadataEvent: {
+            type: "token_usage",
+            inputTokens: inTokens || this.startInputTokens,
+            outputTokens: this.usage.outputTokens || 0,
+          },
+        });
       }
-      // Compute from the merged cumulative usage, not from this message_delta alone: the upstream often reports the full input breakdown
-      // (including cache read/write) in message_start, and at message_delta only
-      // adds an output_tokens. Trusting only the current event drops the cache portion, and the input token count comes out too small.
-      const inTokens = this.usage.inputTokens + this.usage.cacheReadTokens + this.usage.cacheCreationTokens;
-      out.push({
-        metadataEvent: {
-          type: "token_usage",
-          inputTokens: inTokens || this.startInputTokens,
-          outputTokens: this.usage.outputTokens || 0,
-        },
-      });
+      // Kiro treats a stream with text and no metadataEvent.stopReason as truncated, then retries and may append "Continue".
+      const mapped = kiroStopReason(ev.delta && ev.delta.stop_reason);
+      if (mapped) out.push(...this.emitStop(mapped));
+      return out;
+    }
+
+    if (ev.type === "message_stop") {
+      out.push(...this.emitStop(this.fallbackStop()));
+      return out;
     }
 
     return out;
@@ -1013,6 +1059,25 @@ class AnthropicStreamConverter {
       out.push(...this.emitContextPct(this.pendingContextPct));
     }
     return out;
+  }
+
+  // One stop reason per reply. The first explicit Anthropic reason wins, so message_stop cannot overwrite max_tokens.
+  emitStop(reason) {
+    const mapped = kiroStopReason(reason);
+    if (this.stopSent || !mapped) return [];
+    this.stopSent = true;
+    return [{ metadataEvent: { stopReason: mapped } }];
+  }
+
+  fallbackStop() {
+    return this.sawTool || this.inToolUse ? "TOOL_USE" : "END_TURN";
+  }
+
+  // Clean upstream close with no stop frame. Skip a completely empty body so Kiro can still retry a real empty response.
+  finish() {
+    if (this.stopSent) return [];
+    if (!this.sawText && !this.sawTool && !this.inToolUse && !this.sawReasoning) return [];
+    return this.emitStop(this.fallbackStop());
   }
 }
 
@@ -1069,6 +1134,7 @@ function buildIntentClassifierResponse(req, convId, modelId) {
   return [
     { messageMetadataEvent: { conversationId: convId } },
     { assistantResponseEvent: { content: JSON.stringify(probs), modelId } },
+    { metadataEvent: { stopReason: "END_TURN" } },
   ];
 }
 
@@ -1171,6 +1237,7 @@ function writeSetupMessage(res, convId, msg) {
   beginEventStream(res);
   writeEvent(res, { messageMetadataEvent: { conversationId: convId } });
   writeEvent(res, { assistantResponseEvent: { content: msg, modelId: "relay-setup" } });
+  writeEvent(res, { metadataEvent: { stopReason: "END_TURN" } });
   res.end();
 }
 
@@ -1380,6 +1447,7 @@ async function handleGenerate(req, res, bodyBuf) {
     writeEvent(res, {
       assistantResponseEvent: { content: "❌ 无法连接中转站：" + msg, modelId: upstreamModel },
     });
+    writeEvent(res, { metadataEvent: { stopReason: "END_TURN" } });
     res.write(encodeException("InternalServerException", { message: msg }));
     res.end();
     return;
@@ -1397,6 +1465,7 @@ async function handleGenerate(req, res, bodyBuf) {
         modelId: upstreamModel,
       },
     });
+    writeEvent(res, { metadataEvent: { stopReason: "END_TURN" } });
     res.write(encodeException("InternalServerException", { message: "Upstream " + upstream.statusCode }));
     res.end();
     return;
@@ -1421,13 +1490,17 @@ function pumpStream(res, body, convId, modelId, endOnce) {
       if (n) outBytes += n;
     };
 
-    const done = () => {
+    const done = (clean) => {
       if (finished) return;
       finished = true;
       res.removeListener("close", onClientClose);
       try {
         if (!clientClosed && !res.writableEnded) {
           for (const ev of converter.flush()) emit(ev);
+          // A dropped socket or a click on Stop must not look like a normal end_turn.
+          if (clean) {
+            for (const ev of converter.finish()) emit(ev);
+          }
           res.end();
         }
       } catch {}
@@ -1441,7 +1514,7 @@ function pumpStream(res, body, convId, modelId, endOnce) {
     const onClientClose = () => {
       clientClosed = true;
       try { body.destroy(); } catch {}
-      done();
+      done(false);
     };
     res.on("close", onClientClose);
 
@@ -1468,11 +1541,11 @@ function pumpStream(res, body, convId, modelId, endOnce) {
     body.on("end", () => {
       buffer += decoder.end();
       try { processBuffer(); } catch {}
-      done();
+      done(true);
     });
     body.on("error", (e) => {
       log("!! [中转站/KRS] 上游流中断: " + (e?.message || e));
-      done();
+      done(false);
     });
   });
 }
