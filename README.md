@@ -11,7 +11,7 @@ Two modes:
 
 Each mode uses its own local ports. Direct mode uses `19820` and `19821`. Relay mode uses `19830` and `19831`. Credentials for one mode are not overwritten when you edit the other.
 
-The extension id is `local.kiro-gateway`. Commands and settings use the `kiroGateway` prefix, for example `kiroGateway.enabled`.
+The extension id is `kiro-gateway.kiro-gateway`. Commands and settings use the `kiroGateway` prefix, for example `kiroGateway.enabled`.
 
 ## Install
 
@@ -23,7 +23,7 @@ Kiro reads the gateway endpoints once, when the window starts. After you turn th
 
 ## Publishing
 
-Publish each release to Open VSX. Kiro can then update it from the Extensions view. The extension id stays `local.kiro-gateway`, so the Open VSX namespace is `local`. That namespace already exists and has no extensions yet. The publishing account has to be a member of it.
+Publish each release to Open VSX. Kiro can then update it from the Extensions view. The Open VSX namespace is `kiro-gateway`, the same account that publishes the extension.
 
 Create an access token at [open-vsx.org](https://open-vsx.org) after signing the publisher agreement, then either:
 

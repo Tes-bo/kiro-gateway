@@ -2,8 +2,8 @@
 	"name": "kiro-gateway",
 	"displayName": "Kiro Gateway",
 	"description": "Route Kiro's built-in chat through your own API key, JSON login, or an Anthropic-compatible relay.",
-	"version": "2.0.1",
-	"publisher": "local",
+	"version": "2.0.2",
+	"publisher": "kiro-gateway",
 	"license": "MIT",
 	"repository": {
 		"type": "git",

@@ -11,7 +11,7 @@
 
 两种模式各用一组本地端口。直连是 `19820` 和 `19821`，中转站是 `19830` 和 `19831`。编辑一边的凭证不会覆盖另一边。
 
-扩展 id 是 `local.kiro-gateway`。命令和设置使用 `kiroGateway` 前缀，例如 `kiroGateway.enabled`。
+扩展 id 是 `kiro-gateway.kiro-gateway`。命令和设置使用 `kiroGateway` 前缀，例如 `kiroGateway.enabled`。
 
 ## 安装
 
@@ -23,7 +23,7 @@ Kiro 只在窗口启动时读取网关端点。打开网关或切换模式之后
 
 ## 发布
 
-每个版本发到 Open VSX 之后，Kiro 才能按扩展中心的方式更新。扩展 id 保持 `local.kiro-gateway`，所以 Open VSX 上的命名空间是 `local`。这个命名空间已经存在，里面还没有扩展。发布用的账号必须是该命名空间的成员。
+每个版本发到 Open VSX 之后，Kiro 才能按扩展中心的方式更新。Open VSX 上的命名空间是 `kiro-gateway`，和发布扩展的是同一个账号。
 
 在 [open-vsx.org](https://open-vsx.org) 签好发布协议并创建访问令牌，然后可以：
 

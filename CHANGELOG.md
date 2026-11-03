@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.0.2 — 2026-11-03
+
+The Open VSX namespace is `kiro-gateway`. The extension id is `kiro-gateway.kiro-gateway`. The `local` namespace already belonged to someone else, so 2.0.1 could not be published there.
+
+Commands, settings, and saved state still use the `kiroGateway` prefix. The panel footer still shows the release date `2026-11-03`.
+
 ## 2.0.1 — 2026-11-03
 
 Extension updates are left to Kiro. Install the extension from the Extensions view so Kiro can list a new version there and apply it with Restart Extensions. The extension no longer scans the local install every 10 seconds, and the panel no longer has an update banner or an auto-reload switch.

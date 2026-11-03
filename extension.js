@@ -4341,7 +4341,7 @@ async function syncEndpoints() {
 // THIS extension's own entries.
 // ---------------------------------------------------------------------------
 function myExtId() {
-  return extContext?.extension?.id || "local.kiro-gateway";
+  return extContext?.extension?.id || "kiro-gateway.kiro-gateway";
 }
 function myExtDirName() {
   try { return path.basename(extContext.extensionPath); } catch { return ""; }
