@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.7 — 2026-11-04
+
+JSON BuilderId now uses Kiro's fixed profile `arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX`. Github and Google use the other fixed profile unless the credential already has one. That replaces the IDE login's profile on proxied usage, models, chat, and MCP. A JSON key no longer keeps the official `/mcp` passthrough, and a window without this credential no longer restores official endpoints while the gateway is still on. The imported FREE / used / total chip is shown from the snapshot until live usage returns. The panel footer shows `2026-11-04`.
+
 ## 2.0.6 — 2026-11-03
 
 The relay fallback-model field is gone. It was replacing the model selected in chat, so a Haiku turn still went out as whatever id was filled in there. The model id Kiro sends is now forwarded as-is, unless `kiroGateway.relayModelMapping` has an entry for it. A saved fallback value is cleared on startup. The panel footer still shows `2026-11-03`.

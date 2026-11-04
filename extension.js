@@ -709,6 +709,7 @@ function normalizeJsonCred(obj) {
   const region = pickCredField(obj, ["region", "idcRegion", "idc_region", "ssoRegion", "sso_region"])
     || regionFromProfileArn(profileArn);
   const isIdc = !!(clientId && clientSecret) || /idc|sso|oidc/i.test(authMethodRaw);
+  const named = String(provider || "").trim();
   return {
     refreshToken,
     accessToken,
@@ -716,7 +717,7 @@ function normalizeJsonCred(obj) {
     clientId,
     clientSecret,
     authMethod: isIdc ? "idc" : (authMethodRaw || "social"),
-    provider: provider || (isIdc ? "IdC" : "Social"),
+    provider: named || (isIdc ? "IdC" : "Social"),
     region: region || "",
     expiresAt: parseExpiresAt(obj.expiresAt || obj.expires_at || obj.expiresIn || obj.expires_in),
   };
@@ -867,13 +868,32 @@ function tokenTypeForCred(cred) {
   if (cred.authMethod === "idc" || (cred.clientId && cred.clientSecret)) return "SSO_OIDC";
   return "";
 }
+// Kiro does not ask ListAvailableProfiles for these providers. It stamps a fixed profileArn.
+// BuilderId's value is the sentinel AAAACCCCXXXX. Github and Google share the other one.
+// Sending the IDE login's profile with a different account's token is what comes back as Invalid profileArn.
+const KIRO_FIXED_PROFILE = {
+  BuilderId: "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX",
+  Github: "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK",
+  Google: "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK",
+};
+function fixedProfileArn(cred) {
+  if (!cred) return "";
+  const provider = String(cred.provider || "");
+  if (String(cred.authMethod || "") === "social" && cred.profileArn) return String(cred.profileArn);
+  const key = Object.keys(KIRO_FIXED_PROFILE).find((name) => name.toLowerCase() === provider.toLowerCase());
+  return (key && KIRO_FIXED_PROFILE[key]) || "";
+}
+function profileArnForCred(cred) {
+  return fixedProfileArn(cred) || (cred && cred.profileArn) || "";
+}
 function authFromCred(cred, id) {
+  const profileArn = profileArnForCred(cred);
   return {
     type: "oauth",
     key: id,
     token: cred.accessToken || "",
-    profileArn: cred.profileArn || "",
-    region: cred.region || regionFromProfileArn(cred.profileArn) || "",
+    profileArn,
+    region: cred.region || regionFromProfileArn(profileArn) || "",
     tokenType: tokenTypeForCred(cred),
     expiresAt: Number(cred.expiresAt) || 0,
   };
@@ -883,7 +903,15 @@ function peekFreshAuth(key) {
   if (!k) return null;
   if (!isJsonKey(k)) return { type: "apikey", key: k, token: k, profileArn: "", region: "", expiresAt: 0 };
   const memo = _authMemo.get(k);
-  if (memo && memo.token && (!memo.expiresAt || memo.expiresAt - Date.now() > JSON_REFRESH_SKEW_MS)) return memo;
+  if (memo && memo.token && (!memo.expiresAt || memo.expiresAt - Date.now() > JSON_REFRESH_SKEW_MS)) {
+    const fixed = fixedProfileArn(getJsonCred(k));
+    if (fixed && memo.profileArn !== fixed) {
+      const next = { ...memo, profileArn: fixed };
+      _authMemo.set(k, next);
+      return next;
+    }
+    return memo;
+  }
   const cred = getJsonCred(k);
   if (cred && cred.accessToken && cred.expiresAt && cred.expiresAt - Date.now() > JSON_REFRESH_SKEW_MS) {
     const auth = authFromCred(cred, k);
@@ -981,49 +1009,64 @@ async function refreshSocialCred(cred) {
   }
   throw lastErr;
 }
+async function refreshIdcOnce(region, cred, jsonBody) {
+  const url = "https://oidc." + region + ".amazonaws.com/token";
+  const headers = {
+    accept: "application/json",
+    "user-agent": kiroUserAgent(),
+    "content-type": jsonBody ? "application/json" : "application/x-www-form-urlencoded",
+  };
+  const body = jsonBody
+    ? {
+        grantType: "refresh_token",
+        clientId: cred.clientId,
+        clientSecret: cred.clientSecret,
+        refreshToken: cred.refreshToken,
+      }
+    : [
+        "grant_type=refresh_token",
+        "client_id=" + encodeURIComponent(cred.clientId),
+        "client_secret=" + encodeURIComponent(cred.clientSecret),
+        "refresh_token=" + encodeURIComponent(cred.refreshToken),
+      ].join("&");
+  const res = await httpsExchange("POST", url, headers, body, 20000);
+  if (res.statusCode < 200 || res.statusCode >= 300) {
+    const err = new Error("HTTP " + res.statusCode + ": " + String(res.body || "").slice(0, 180));
+    err.status = res.statusCode;
+    err.body = res.body || "";
+    throw err;
+  }
+  const data = JSON.parse(res.body || "{}");
+  const accessToken = data.access_token || data.accessToken;
+  if (!accessToken) throw new Error("OIDC refresh 响应没有 access_token");
+  return {
+    accessToken,
+    refreshToken: data.refresh_token || data.refreshToken || cred.refreshToken,
+    profileArn: fixedProfileArn(cred) || cred.profileArn || "",
+    expiresAt: parseExpiresAt(data.expires_in || data.expiresIn || data.expiresAt || data.expires_at || 3600),
+    region,
+  };
+}
 async function refreshIdcCred(cred) {
-  // Kiro's BuilderId / IdC uses SSO OIDC CreateToken: POST /token, JSON, camelCase fields.
-  // application/x-www-form-urlencoded is treated as an illegal request by this API and it returns
-  // 400 invalid_request (the one whose location/reason are empty); the refresh token itself is not bad.
+  // BuilderId is an IdC client. Kiro's SSO OIDC CreateToken accepts a JSON body; the older
+  // gateway used a form body. Try the form first, then the JSON body, and stop on invalid_grant
+  // so a dead refresh token is not retried into a rotation.
   const regions = [...new Set([
     cred.region,
     regionFromProfileArn(cred.profileArn),
+    regionFromProfileArn(fixedProfileArn(cred)),
     "us-east-1",
   ].map((r) => String(r || "").trim()).filter(Boolean))];
   let lastErr = new Error("refresh failed");
   for (const region of regions) {
-    const url = "https://oidc." + region + ".amazonaws.com/token";
-    try {
-      const res = await httpsExchange("POST", url, {
-        "content-type": "application/json",
-        accept: "application/json",
-        "user-agent": kiroUserAgent(),
-      }, {
-        clientId: cred.clientId,
-        clientSecret: cred.clientSecret,
-        grantType: "refresh_token",
-        refreshToken: cred.refreshToken,
-      }, 20000);
-      if (res.statusCode < 200 || res.statusCode >= 300) {
-        lastErr = new Error("HTTP " + res.statusCode + ": " + String(res.body || "").slice(0, 180));
-        if (res.statusCode === 400 && /invalid_grant/i.test(res.body || "")) break;
-        continue;
+    for (const jsonBody of [false, true]) {
+      try {
+        return await refreshIdcOnce(region, cred, jsonBody);
+      } catch (e) {
+        lastErr = e;
+        const body = String(e && e.body || e && e.message || "");
+        if (e && e.status === 400 && /invalid_grant/i.test(body)) throw e;
       }
-      const data = JSON.parse(res.body || "{}");
-      const accessToken = data.accessToken || data.access_token;
-      if (!accessToken) {
-        lastErr = new Error("OIDC refresh 响应没有 accessToken");
-        continue;
-      }
-      return {
-        accessToken,
-        refreshToken: data.refreshToken || data.refresh_token || cred.refreshToken,
-        profileArn: cred.profileArn || "",
-        expiresAt: parseExpiresAt(data.expiresIn || data.expires_in || data.expiresAt || data.expires_at || 3600),
-        region,
-      };
-    } catch (e) {
-      lastErr = e;
     }
   }
   throw lastErr;
@@ -1091,16 +1134,24 @@ function findProfileArnDeep(node, depth = 0) {
   }
   return "";
 }
+// Confirmed this session. A profileArn saved earlier can be the IDE login's ARN, which the usage
+// API rejects as Invalid profileArn. Ask ListAvailableProfiles once and keep that answer.
+const _profileConfirmed = new Set();
 async function lookupProfileArn(auth) {
-  if (!auth || auth.type === "apikey" || auth.profileArn) return (auth && auth.profileArn) || "";
+  if (!auth || auth.type === "apikey") return "";
   const region = auth.region || getRegion();
-  const paths = [
-    "/List-Available-Profiles?origin=AI_EDITOR",
-    "/Get-Profile?origin=AI_EDITOR",
+  const bare = { ...auth, profileArn: "" };
+  const calls = [
+    { path: "/ListAvailableProfiles", body: { origin: "AI_EDITOR" } },
+    { path: "/GetProfile", body: { origin: "AI_EDITOR" } },
   ];
-  for (const p of paths) {
+  for (const call of calls) {
     try {
-      const res = await apiGetWithAuth(managementBaseFor(region), p, auth, { timeoutMs: 8000 });
+      const res = await apiSendWithAuth(managementBaseFor(region), call.path, bare, {
+        method: "POST",
+        body: call.body,
+        timeoutMs: 8000,
+      });
       if (res.statusCode < 200 || res.statusCode >= 300) continue;
       let data;
       try { data = JSON.parse(res.body || "{}"); } catch { continue; }
@@ -1111,17 +1162,35 @@ async function lookupProfileArn(auth) {
   return "";
 }
 async function attachProfileArn(id, auth) {
-  if (!auth || auth.type !== "oauth" || auth.profileArn) return auth;
+  if (!auth || auth.type !== "oauth") return auth;
   const cred = getJsonCred(id) || {};
-  if (cred.profileLookupTried) return auth;
+  const fixed = fixedProfileArn(cred);
+  if (fixed) {
+    if (auth.profileArn === fixed && cred.profileArn === fixed) return auth;
+    if (cred.profileArn !== fixed) {
+      await upsertJsonCred(id, {
+        ...cred,
+        profileArn: fixed,
+        region: cred.region || regionFromProfileArn(fixed) || auth.region || "",
+      }, { keepMemo: true });
+    }
+    const next = authFromCred({ ...cred, profileArn: fixed }, id);
+    next.token = auth.token || next.token;
+    next.expiresAt = auth.expiresAt || next.expiresAt;
+    _authMemo.set(id, next);
+    if (auth.profileArn !== fixed) log("[JSON] 使用固定 profile " + displayJsonKey(id));
+    return next;
+  }
+  if (_profileConfirmed.has(id) && auth.profileArn) return auth;
   const arn = await lookupProfileArn(auth);
+  if (!arn) return auth;
+  _profileConfirmed.add(id);
   const saved = await upsertJsonCred(id, {
     ...cred,
-    profileArn: arn || cred.profileArn || "",
+    profileArn: arn,
     region: regionFromProfileArn(arn) || cred.region || auth.region || "",
     profileLookupTried: true,
   }, { keepMemo: true });
-  if (!arn) return auth;
   const next = authFromCred(saved, id);
   _authMemo.set(id, next);
   log("[JSON] 补到 profileArn " + displayJsonKey(id));
@@ -2955,8 +3024,10 @@ const PROFILE_HEADER_NAMES = ["x-amzn-kiro-profile", "x-amzn-kiro-profile-arn", 
 function alignProfileHeaders(headers, auth) {
   const arn = auth && auth.type !== "apikey" ? String(auth.profileArn || "") : "";
   let changed = false;
+  let seen = false;
   for (const k of Object.keys(headers)) {
     if (!PROFILE_HEADER_NAMES.includes(k.toLowerCase())) continue;
+    seen = true;
     if (!arn) {
       delete headers[k];
       changed = true;
@@ -2966,6 +3037,10 @@ function alignProfileHeaders(headers, auth) {
       headers[k] = arn;
       changed = true;
     }
+  }
+  if (arn && !seen) {
+    headers["x-amzn-kiro-profile-arn"] = arn;
+    changed = true;
   }
   return changed;
 }
@@ -3223,11 +3298,10 @@ function makeProxyHandler(label, baseFn, opts = {}) {
       send();
       };
       const cached = peekFreshAuth(apiKey);
-      if (cached && cached.token) {
-        finish(cached);
-        return;
-      }
-      resolveAuth(apiKey).then(finish).catch((e) => {
+      const pending = cached && cached.token
+        ? attachProfileArn(apiKey, cached)
+        : resolveAuth(apiKey);
+      pending.then(finish).catch((e) => {
         log("!! [" + label + "] 凭证刷新失败: " + (e && e.message ? e.message : e));
         if (!res.headersSent) {
           res.writeHead(401, { "Content-Type": "application/json" });
@@ -3284,7 +3358,9 @@ function makeKrsHandler() {
       // Remote Tools uses the official profile-bound MCP API. It must bypass
       // every ksk_-specific mutation, including profileArn stripping, prompt
       // injection, key rotation and the no-interrupt retry loop.
-      if (isOfficialKrsPassthrough(req)) {
+      // ksk_ cannot call Remote Tools. A JSON login can, and must: leaving /mcp on the IDE bearer
+      // keeps the signed-in account in the avatar path even after a JSON credential is selected.
+      if (isOfficialKrsPassthrough(req) && !isJsonKey(pickStartKey() || getApiKey())) {
         forwardOfficialKrsRequest(req, res, incomingBody);
         return;
       }
@@ -3368,8 +3444,12 @@ function makeKrsHandler() {
       const attempt = (n, body, key, epIdx = startEpIdx) => {
         const begin = (auth) => attemptReady(n, body, key, epIdx, auth);
         const cached = peekFreshAuth(key);
-        if (cached && cached.token) return begin(cached);
-        resolveAuth(key).then(begin).catch((e) => {
+        // A still-fresh access token used to skip profile lookup. The request then kept the IDE
+        // login's profileArn and upstream answered 403 Invalid token.
+        const pending = cached && cached.token
+          ? attachProfileArn(key, cached)
+          : resolveAuth(key);
+        pending.then(begin).catch((e) => {
           log("!! [KRS] 凭证刷新失败: " + maskKey(key) + " " + (e && e.message ? e.message : e));
           try { coolDownKey(key, "invalid"); } catch {}
           try { maybeAdoptUsableKey(); } catch {}
@@ -4456,6 +4536,14 @@ async function syncEndpoints() {
       : "!! gateway endpoint verification incomplete: KRS/CPS override is partial");
     return { bound: ok, changed: a.changed || b.changed };
   }
+  // A window that is still enabled, or that cannot see the credentials, must not point Kiro
+  // back at the official account. That is what left CPS empty while chat still hit the proxy,
+  // so the avatar stayed on the IDE login.
+  if (isEnabled() || !credentialsReady()) {
+    log("leave endpoints as they are"
+      + (isEnabled() ? " (gateway enabled, listeners not ready)" : " (this window has no credentials)"));
+    return { bound: false, changed: false };
+  }
   const a = await restoreEndpoint("krsEndpoints", "__kiroKeyOrigKrs");
   const b = await restoreEndpoint("cpsEndpoints", "__kiroKeyOrigCps");
   return { bound: false, changed: a || b };
@@ -4561,10 +4649,15 @@ function apiGet(base, urlPath, key, opts = {}) {
   return Promise.resolve(resolveAuth(k)).then((auth) => apiGetWithAuth(base, urlPath, auth, opts));
 }
 function apiGetWithAuth(base, urlPath, auth, opts = {}) {
+  return apiSendWithAuth(base, urlPath, auth, opts);
+}
+function apiSendWithAuth(base, urlPath, auth, opts = {}) {
   const timeoutMs = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : 30000;
+  const method = opts.method || "GET";
   const path = auth.type === "apikey"
     ? stripProfileArnFromUrl(urlPath)
     : applyProfileArnToUrl(urlPath, auth.profileArn);
+  const payload = opts.body == null ? null : Buffer.from(JSON.stringify(opts.body), "utf8");
   return new Promise((resolve, reject) => {
     let target;
     try { target = new URL(base + path); } catch (e) { return reject(e); }
@@ -4574,11 +4667,16 @@ function apiGetWithAuth(base, urlPath, auth, opts = {}) {
       "x-amzn-kiro-agent-mode": "vibe",
       "user-agent": kiroUserAgent(),
     };
+    if (payload) {
+      headers["content-type"] = "application/json";
+      headers["content-length"] = String(payload.length);
+    }
     if (auth.type === "apikey") headers.tokentype = "API_KEY";
     else if (auth.tokenType) headers.tokentype = auth.tokenType;
+    if (auth.type !== "apikey" && auth.profileArn) headers["x-amzn-kiro-profile-arn"] = auth.profileArn;
     const req = https.request(
       {
-        method: "GET",
+        method,
         hostname: target.hostname,
         port: 443,
         path: target.pathname + target.search,
@@ -4594,6 +4692,7 @@ function apiGetWithAuth(base, urlPath, auth, opts = {}) {
     );
     req.on("error", reject);
     req.on("timeout", () => req.destroy(new Error("timeout")));
+    if (payload) req.write(payload);
     req.end();
   });
 }
@@ -4632,7 +4731,10 @@ async function cpsGetForKey(key, urlPath) {
   return apiGet(managementBaseFor(detected), urlPath, k);
 }
 async function fetchModels(key) {
-  const path = "/List-Available-Models?origin=AI_EDITOR&maxResults=200";
+  const paths = [
+    "/ListAvailableModels?origin=AI_EDITOR&maxResults=200",
+    "/List-Available-Models?origin=AI_EDITOR&maxResults=200",
+  ];
   const order = [];
   const pushRegion = (region) => {
     const v = String(region || "").trim();
@@ -4645,12 +4747,20 @@ async function fetchModels(key) {
   let empty = null;
   for (const region of order) {
     let res;
-    try {
-      res = await apiGet(managementBaseFor(region), path, key);
-    } catch (e) {
-      lastErr = e;
-      continue;
+    let skipRegion = false;
+    for (const path of paths) {
+      try {
+        res = await apiGet(managementBaseFor(region), path, key);
+      } catch (e) {
+        lastErr = e;
+        skipRegion = true;
+        break;
+      }
+      if (res.statusCode === 404) continue;
+      skipRegion = false;
+      break;
     }
+    if (skipRegion || !res) continue;
     if (res.statusCode < 200 || res.statusCode >= 300) {
       lastErr = httpError(res.statusCode, res.body);
       continue;
@@ -4683,9 +4793,18 @@ async function fetchModels(key) {
   throw lastErr || new Error("无法获取模型列表");
 }
 async function fetchUsage(key) {
-  const res = await cpsGetForKey(key, "/Get-Usage-Limits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST");
-  if (res.statusCode < 200 || res.statusCode >= 300) throw httpError(res.statusCode, res.body);
-  return JSON.parse(res.body);
+  const paths = [
+    "/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
+    "/Get-Usage-Limits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
+  ];
+  let last = null;
+  for (const path of paths) {
+    const res = await cpsGetForKey(key, path);
+    if (res.statusCode === 404) { last = res; continue; }
+    if (res.statusCode < 200 || res.statusCode >= 300) throw httpError(res.statusCode, res.body);
+    return JSON.parse(res.body);
+  }
+  throw httpError(last ? last.statusCode : 404, last ? last.body : "");
 }
 async function testKey(key) {
   const k = (key || getApiKey() || "").trim();
@@ -4710,7 +4829,7 @@ async function testKey(key) {
 //   429  → it recognizes it but is being throttled; a fallback (used only when there is no 2xx);
 //   other → it does not belong to this region (403 is the typical cross-region refusal).
 // The probe is the lightest GET (Get-Usage-Limits) and does not consume quota.
-const REGION_PROBE_PATH = "/Get-Usage-Limits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST";
+const REGION_PROBE_PATH = "/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST";
 const REGION_PROBE_TIMEOUT_MS = 8000;
 let _regionDetecting = null; // The probe Promise in flight, so concurrent probes are not duplicated
 let _regionDetectBusy = false; // The panel needs to show "detecting", so the flag has to be set synchronously before the probe
@@ -6540,6 +6659,30 @@ class ControlPanelProvider {
       repoUrl: REPO_URL,
     });
     this.pushStats();
+    this.publishImportedAccounts();
+  }
+  // Show the imported FREE / used / total chip immediately. A failed live usage call must not
+  // be the first result the panel sees, or the chip stays blank until a later success.
+  publishImportedAccounts() {
+    for (const key of getApiKeys()) {
+      if (!isJsonKey(key)) continue;
+      const cred = getJsonCred(key);
+      const seed = cred && cred.importedUsage;
+      if (!seed || (seed.used == null && seed.total == null && !seed.subscriptionTitle)) continue;
+      const title = seed.subscriptionTitle || "";
+      this.post({
+        type: "accountResult",
+        key: panelFullKey(key),
+        ok: true,
+        info: {
+          subscriptionTitle: title,
+          tier: tierFromTitle(title),
+          used: seed.used,
+          total: seed.total,
+          resetAt: seed.resetAt || 0,
+        },
+      });
+    }
   }
   // Live counters for the panel's "stats" card. Keys that are cooling down are sent along: the panel pulls every few seconds,
   // so the remaining cooldown can tick on its own.
