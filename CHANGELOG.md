@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.9 — 2026-11-06
+
+An HTTP 429 is treated as a user rate limit even when the body is only `ThrottlingException` / `Rate exceeded` and has no `USER_REQUEST_RATE_EXCEEDED` token. 2.0.8 missed those and handed the error to Kiro immediately if patience mode was off. The wait is still the same request, same key, same endpoint. The panel footer still shows `2026-11-06`.
+
 ## 2.0.8 — 2026-11-06
 
 A user rate limit (`USER_REQUEST_RATE_EXCEEDED` / "sending requests faster") now waits for `retryAfter` (at least 15 seconds, at most three times) and resends the same request on the same key and endpoint. It does not switch endpoints, switch accounts, or rewrite the user message. The panel keeps one switch, on by default. Keyword match/reply rules and the 2-second retry interval are gone. After the waits are used up, the error goes back to Kiro. The panel footer shows `2026-11-06`.
