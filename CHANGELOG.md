@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.10 — 2026-11-06
+
+The user-rate wait is 3s, then 6s, then 12s (at most three times). 2.0.9 waited 15s, which is longer than Kiro will hold a request with no bytes, so the toast became "Your connection was interrupted" after a successful resend. Still the same key, same endpoint, same body. The panel footer still shows `2026-11-06`.
+
 ## 2.0.9 — 2026-11-06
 
 An HTTP 429 is treated as a user rate limit even when the body is only `ThrottlingException` / `Rate exceeded` and has no `USER_REQUEST_RATE_EXCEEDED` token. 2.0.8 missed those and handed the error to Kiro immediately if patience mode was off. The wait is still the same request, same key, same endpoint. The panel footer still shows `2026-11-06`.

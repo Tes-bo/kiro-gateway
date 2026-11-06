@@ -1523,8 +1523,11 @@ function isThrottleFailure(status, text) {
 // dead account, and it is not an endpoint-only bucket. The old path switched
 // KRS→Q and keys on a 1.5s timer; that is the spray we must not do here.
 const USER_RATE_LIMIT_RE = /USER_REQUEST_RATE_EXCEEDED|CREDIT_CONSUMPTION_RATE_EXCEEDED|faster than your rate limit|sending requests faster|throttlingexception|rate exceeded|too many requests/i;
-const USER_RATE_WAIT_FLOOR_MS = 15000;
-const USER_RATE_WAIT_CAP_MS = 120000;
+// Keep this under Kiro's silent-HTTP cutoff (~20s). A 15s wait plus retry RTT
+// made Kiro abort with "Your connection was interrupted" after the 429 was
+// already caught. 3s / 6s / 12s still is not the old 1.5s KRS↔Q spray.
+const USER_RATE_WAIT_FLOOR_MS = 3000;
+const USER_RATE_WAIT_CAP_MS = 12000;
 const USER_RATE_RETRY_MAX = 3;
 function isUserRequestRateLimit(text, status) {
   // Upstream 429 JSON is often just {"message":"Rate exceeded","__type":"ThrottlingException"}

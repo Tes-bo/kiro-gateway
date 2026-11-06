@@ -1,0 +1,18 @@
+---
+description: Do not revive the 1.1.44–47 ban-risk spray/identity path
+alwaysApply: true
+---
+
+# Do not revive the 1.1.44–47 ban path
+
+The owner treats 1.1.44–47 as the changes that got accounts suspended. Do not put any of that back.
+
+Forbidden:
+
+- Short-interval KRS ↔ Q endpoint spray (including 1.5s round delays on 429)
+- Invented `machineId`, User-Agent churn, or a profile header that does not match the current account
+- Switching keys or cooling a key because of 429 / `USER_REQUEST_RATE_EXCEEDED`
+- Rewriting the user message from a keyword/reply rule and resending that
+- Wiring `throttleRetryForever` or keyword retry onto user rate limits
+
+User rate limits: same key, same endpoint, same body, wait, then resend. A wait that is too long makes Kiro drop the HTTP call. That is not a reason to spray again.
