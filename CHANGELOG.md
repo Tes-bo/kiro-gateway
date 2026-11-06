@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.11 — 2026-11-06
+
+Relay mode now uses IPv4 (`family: 4`) and retries at most three times when TLS fails with `before secure TLS`. Same URL, same headers, same body. Timeouts and disconnects after the handshake are not resent. Official direct mode already did this; the chat line "无法连接中转站" was the relay path giving up on the first handshake drop. The panel footer still shows `2026-11-06`.
+
 ## 2.0.10 — 2026-11-06
 
 The user-rate wait is 3s, then 6s, then 12s (at most three times). 2.0.9 waited 15s, which is longer than Kiro will hold a request with no bytes, so the toast became "Your connection was interrupted" after a successful resend. Still the same key, same endpoint, same body. The panel footer still shows `2026-11-06`.

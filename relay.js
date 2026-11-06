@@ -149,8 +149,31 @@ function writeEvent(res, ev) {
 // ---------------------------------------------------------------------------
 const UPSTREAM_TIMEOUT_MS = 30 * 60 * 1000; // Generation requests can take a long time; leave plenty of headroom
 const PROBE_TIMEOUT_MS = 15 * 1000;         // Small requests such as the model list / usage
+const RELAY_TLS_RETRY_MAX = 3;
+const RELAY_TLS_FAIL_RE = /before secure tls/i;
+const RELAY_AGENT_OPTS = {
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  maxSockets: 32,
+  maxFreeSockets: 8,
+  scheduling: "lifo",
+  timeout: UPSTREAM_TIMEOUT_MS,
+  family: 4, // A broken IPv6 path drops the connection before the TLS handshake finishes
+};
+const RELAY_AGENT_HTTPS = new https.Agent(RELAY_AGENT_OPTS);
+const RELAY_AGENT_HTTP = new http.Agent(RELAY_AGENT_OPTS);
 
-function requestUpstream(method, urlStr, headers, body, timeoutMs = UPSTREAM_TIMEOUT_MS) {
+function destroyFreeSockets(agent) {
+  const free = (agent && agent.freeSockets) || {};
+  for (const name of Object.keys(free)) {
+    for (const sock of free[name] || []) {
+      try { sock.destroy(); } catch {}
+    }
+  }
+}
+
+function requestUpstream(method, urlStr, headers, body, timeoutMs = UPSTREAM_TIMEOUT_MS, attempt = 0) {
+  const n = Number(attempt) || 0;
   return new Promise((resolve, reject) => {
     let url;
     try {
@@ -164,6 +187,7 @@ function requestUpstream(method, urlStr, headers, body, timeoutMs = UPSTREAM_TIM
       return;
     }
     const lib = url.protocol === "http:" ? http : https;
+    const agent = lib === https ? RELAY_AGENT_HTTPS : RELAY_AGENT_HTTP;
     const payload = body === undefined ? undefined
       : Buffer.isBuffer(body) ? body : Buffer.from(body, "utf8");
     const finalHeaders = { ...headers };
@@ -177,10 +201,28 @@ function requestUpstream(method, urlStr, headers, body, timeoutMs = UPSTREAM_TIM
         path: url.pathname + url.search,
         headers: finalHeaders,
         timeout: timeoutMs,
+        family: 4,
+        agent,
       },
       (res) => resolve({ statusCode: res.statusCode || 0, headers: res.headers, body: res })
     );
-    req.on("error", (e) => reject(e));
+    // Retry only when TLS has not been established yet. The body never reached the
+    // relay, so this is the same request, same URL, same headers. Timeouts and
+    // post-handshake disconnects are not resent.
+    const fail = (e) => {
+      const msg = e && e.message ? e.message : String(e || "");
+      if (n < RELAY_TLS_RETRY_MAX && RELAY_TLS_FAIL_RE.test(msg)) {
+        destroyFreeSockets(agent);
+        const waitMs = 1000 * (n + 1);
+        log("中转站 TLS 握手未完成，" + waitMs + "ms 后原请求重发（第 " + (n + 1) + "/" + RELAY_TLS_RETRY_MAX + " 次，不换地址、不改请求）");
+        setTimeout(() => {
+          requestUpstream(method, urlStr, headers, body, timeoutMs, n + 1).then(resolve, reject);
+        }, waitMs);
+        return;
+      }
+      reject(e instanceof Error ? e : new Error(msg));
+    };
+    req.on("error", fail);
     req.on("timeout", () => { req.destroy(new Error("中转站请求超时")); });
     if (payload) req.write(payload);
     req.end();
