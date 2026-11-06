@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.0.8 — 2026-11-06
+
+A user rate limit (`USER_REQUEST_RATE_EXCEEDED` / "sending requests faster") now waits for `retryAfter` (at least 15 seconds, at most three times) and resends the same request on the same key and endpoint. It does not switch endpoints, switch accounts, or rewrite the user message. The panel keeps one switch, on by default. Keyword match/reply rules and the 2-second retry interval are gone. After the waits are used up, the error goes back to Kiro. The panel footer shows `2026-11-06`.
+
 ## 2.0.7 — 2026-11-04
 
 JSON BuilderId now uses Kiro's fixed profile `arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX`. Github and Google use the other fixed profile unless the credential already has one. That replaces the IDE login's profile on proxied usage, models, chat, and MCP. A JSON key no longer keeps the official `/mcp` passthrough, and a window without this credential no longer restores official endpoints while the gateway is still on. The imported FREE / used / total chip is shown from the snapshot until live usage returns. The panel footer shows `2026-11-04`.

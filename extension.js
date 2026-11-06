@@ -1425,12 +1425,15 @@ function normalizeRetryRules(raw) {
     .filter((r) => r.match)
     .slice(0, 50);
 }
+function userRateLimitWaitEnabled() {
+  return pref("userRateLimitWait", true) !== false;
+}
 function getRetryPrefs() {
   const max = Math.round(Number(pref("retryMax", 2)));
   const delay = Math.round(Number(pref("retryDelayMs", 2000)));
   return {
-    enabled: pref("retryEnabled", false) === true,
-    rules: normalizeRetryRules(pref("retryRules", undefined)),
+    enabled: userRateLimitWaitEnabled(),
+    rules: [],
     max: Number.isFinite(max) ? Math.min(Math.max(max, 1), RETRY_MAX_CAP) : 2,
     delayMs: Number.isFinite(delay) ? Math.min(Math.max(delay, 0), 60000) : 2000,
   };
@@ -1514,6 +1517,46 @@ function isThrottleFailure(status, text) {
   // A transport error has no status code; a 2xx can also hide a throttle error frame (HTTP 200 + ThrottlingException).
   if (!status || (status >= 200 && status < 300)) return THROTTLE_RE.test(String(text || ""));
   return false;
+}
+// Per-user / per-account send rate. Kiro surfaces this as ClientThrottleError
+// ("You're sending requests faster than your rate limit allows"). It is not a
+// dead account, and it is not an endpoint-only bucket. The old path switched
+// KRS→Q and keys on a 1.5s timer; that is the spray we must not do here.
+const USER_RATE_LIMIT_RE = /USER_REQUEST_RATE_EXCEEDED|CREDIT_CONSUMPTION_RATE_EXCEEDED|faster than your rate limit|sending requests faster/i;
+const USER_RATE_WAIT_FLOOR_MS = 15000;
+const USER_RATE_WAIT_CAP_MS = 120000;
+const USER_RATE_RETRY_MAX = 3;
+function isUserRequestRateLimit(text) {
+  return USER_RATE_LIMIT_RE.test(String(text || ""));
+}
+function parseRetryAfterMs(headers, text) {
+  const hdrs = headers || {};
+  for (const [k, v] of Object.entries(hdrs)) {
+    const name = String(k || "").toLowerCase();
+    if (name !== "retry-after" && name !== "x-amz-retry-after") continue;
+    const n = Number(v);
+    if (Number.isFinite(n) && n >= 0) return n > 1000 ? n : n * 1000;
+  }
+  const raw = String(text || "");
+  const field = raw.match(/retryAfterMilliseconds["'\s:=]+(\d+)/i)
+    || raw.match(/"retryAfterMilliseconds"\s*:\s*(\d+)/i);
+  if (field) {
+    const n = Number(field[1]);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  const seconds = raw.match(/please wait\s+(\d+)\s*(?:second|seconds|s)\b/i);
+  if (seconds) {
+    const n = Number(seconds[1]);
+    if (Number.isFinite(n) && n > 0) return n * 1000;
+  }
+  return 0;
+}
+function userRateWaitMs(headers, text, prevWaitMs) {
+  const asked = parseRetryAfterMs(headers, text);
+  const next = prevWaitMs > 0
+    ? Math.max(asked, prevWaitMs * 2, USER_RATE_WAIT_FLOOR_MS)
+    : Math.max(asked, USER_RATE_WAIT_FLOOR_MS);
+  return Math.min(next, USER_RATE_WAIT_CAP_MS);
 }
 // Whether this failure means "this endpoint does not recognize this operation" (a missing endpoint capability, separate from throttling).
 const UNSUPPORTED_OP_RE = /unknownoperation|operation is not recognized/i;
@@ -2936,14 +2979,6 @@ function retryHaystack(status, bodyText) {
 // Without a chance for the reply text to cut in line, this rule never gets to run.
 // A rule with an empty reply still lets the switch go first — resending as-is and resending on another account are no different, and switching accounts means more.
 function matchedRetryRule(status, bodyText, opts = {}) {
-  const p = getRetryPrefs();
-  if (!p.enabled) return null;
-  const haystack = retryHaystack(status, bodyText);
-  for (const rule of p.rules) {
-    if (!rule.enabled) continue;
-    if (opts.replyOnly && !rule.reply) continue;
-    if (haystack.includes(rule.match.toLowerCase())) return rule;
-  }
   return null;
 }
 
@@ -3404,7 +3439,7 @@ function makeKrsHandler() {
       }
       const statModel = modelIdFromBody(bodyBuf);
       const retryCfg = getRetryPrefs();
-      const maxAttempts = retryCfg.enabled ? retryCfg.max + 1 : 1;
+      const maxAttempts = 1;
       // Automatic key switch: start from the one the user selected (skip it first if it is cooling down).
       //
       // This no longer limits itself to "try each one only once, then give up". The goal is not to interrupt this turn of Kiro's conversation: as long as
@@ -3430,6 +3465,10 @@ function makeKrsHandler() {
       // conditions for settling, and mixing them interferes with the attempt counts.
       let serverRetries = 0;
       let serverBackoffMs = 0;
+      // Conservative wait for USER_REQUEST_RATE_EXCEEDED. Same key, same endpoint,
+      // same body. Do not walk the old KRS→Q / key-spray path.
+      let userRateRetries = 0;
+      let userRateWaitedMs = 0;
       // If Kiro cancels the request (user hits stop, window reload…) there is
       // nobody left to answer, so a pending retry must not fire.
       let clientGone = false;
@@ -3532,6 +3571,7 @@ function makeKrsHandler() {
         // currentMessage), so the reply text has nowhere to apply, and letting it cut in line only waits one round for nothing before switching accounts.
         const replyRuleFirst = (status, text) => {
           if (!isChat || n >= maxAttempts) return null;
+          if (isUserRequestRateLimit(text)) return null;
           return matchedRetryRule(status, text, { replyOnly: true });
         };
         // How long until the soonest cooldown expires (0 when no account is cooling down). This only serves the wait calculation below.
@@ -3621,6 +3661,27 @@ function makeKrsHandler() {
         // It shares the same exponential growth and cap as the throttle backoff, but the number of tries is limited: throttling is "wait and it will pass",
         // and waiting long enough is bound to get through, while a 5xx that keeps coming is more likely a real problem (typical when an account is over quota and upstream
         // behavior is unstable and keeps emitting 500). Retrying without limit only leaves the conversation spinning with no result.
+        const tryRetryUserRateLimit = (status, bodyText, headers) => {
+          if (clientGone) return false;
+          if (res.headersSent) return false;
+          if (!isUserRequestRateLimit(bodyText)) return false;
+          if (!userRateLimitWaitEnabled()) return false;
+          if (userRateRetries >= USER_RATE_RETRY_MAX) {
+            log("!! [KRS] 账号限流: 已按原请求等待重发 " + userRateRetries + "/" + USER_RATE_RETRY_MAX
+              + " 次仍未成功，把错误交回 Kiro（不换端点、不换号）");
+            return false;
+          }
+          userRateRetries += 1;
+          const waitMs = userRateWaitMs(headers, bodyText, userRateWaitedMs);
+          userRateWaitedMs = waitMs;
+          log("[KRS] 账号限流: " + waitMs + "ms 后原请求重发"
+            + "（第 " + userRateRetries + "/" + USER_RATE_RETRY_MAX + " 次，不换端点、不换号、不改用户消息）");
+          setTimeout(() => {
+            if (clientGone || res.headersSent) return;
+            attempt(n, body, key, epIdx);
+          }, waitMs);
+          return true;
+        };
         const tryRetryServerError = (status, bodyText) => {
           if (clientGone) return false;
           if (!isTransientServerFailure(status, bodyText)) return false;
@@ -3776,6 +3837,7 @@ function makeKrsHandler() {
             // and keyIsUsable does not look at it at all. The user needs to see that it is being throttled right now, while selection can still
             // use this account — in a single-key setup the only one must not be judged unusable just because of throttling.
             noteKeyThrottled(key);
+            if (isUserRequestRateLimit(bodyText)) return false;
             return keepTrying(maskKey(key) + " 限流（不标记账号状态）");
           }
           coolDownKey(key, kind);
@@ -3812,6 +3874,15 @@ function makeKrsHandler() {
                 // Judge a missing endpoint capability first: this 400 was caused by our diversion and has nothing to do with the account.
                 // Handing it back to Kiro is a red error in the chat window.
                 if (trySwitchEndpointUnsupported(status, bodyText)) { endOnce(false, false); return; }
+                // Per-user rate limit: wait, then resend this same request. Do not fall
+                // through to endpoint/key spraying; that is the old path.
+                if (tryRetryUserRateLimit(status, bodyText, upRes.headers)) { endOnce(false, false); return; }
+                if (isUserRequestRateLimit(bodyText)) {
+                  log("[KRS] 账号限流: 等待重发已关，把错误交回 Kiro");
+                  endOnce(false);
+                  sendBufferedBody(res, status, upRes.headers, Buffer.concat(parts));
+                  return;
+                }
                 // Throttling: switch endpoints → backoff across rounds → switch accounts → back off and come around again, without touching key state the whole way.
                 if (handleThrottle(status, bodyText)) { endOnce(false, false); return; }
                 // A temporary upstream fault: back off and resend on the original endpoint. Do not switch keys and do not switch endpoints.
@@ -3948,6 +4019,11 @@ function makeKrsHandler() {
                 // An error frame can also hide a missing capability, throttling, and a temporary upstream fault — the status code is 200,
                 // and looking only at the status code cannot reach any of those three paths.
                 if (trySwitchEndpointUnsupported(status, streamErr)) { handled = true; endOnce(false, false); return true; }
+                if (tryRetryUserRateLimit(status, streamErr, upRes.headers)) { handled = true; endOnce(false, false); return true; }
+                if (isUserRequestRateLimit(streamErr)) {
+                  log("[KRS] 账号限流: 等待重发已关或次数用尽，把错误帧交回 Kiro");
+                  return false;
+                }
                 if (handleThrottle(status, streamErr)) { handled = true; endOnce(false, false); return true; }
                 if (tryRetryServerError(status, streamErr)) { handled = true; endOnce(false, false); return true; }
                 const replyRule = replyRuleFirst(status, streamErr);
@@ -3974,6 +4050,11 @@ function makeKrsHandler() {
               // then record account state, and finally hand it to the no-interrupt fallback — if we can switch accounts or wait out a cooldown, never hand the failure
               // back to Kiro.
               if (trySwitchEndpointUnsupported(status, evidence)) { handled = true; endOnce(false, false); return true; }
+              if (tryRetryUserRateLimit(status, evidence, upRes.headers)) { handled = true; endOnce(false, false); return true; }
+              if (isUserRequestRateLimit(evidence)) {
+                log("[KRS] 账号限流: 等待重发已关或次数用尽，把错误交回 Kiro");
+                return false;
+              }
               if (handleThrottle(status, evidence)) { handled = true; endOnce(false, false); return true; }
               if (tryRetryServerError(status, evidence)) { handled = true; endOnce(false, false); return true; }
               const kind = keyFailureKind(status, evidence);
@@ -7287,16 +7368,7 @@ class ControlPanelProvider {
         this.post({ type: "toast", message: "已重置全部账号状态" });
         break;
       case "setRetry": {
-        if (typeof msg.enabled === "boolean") await setPref("retryEnabled", msg.enabled);
-        if (Array.isArray(msg.rules)) await setPref("retryRules", normalizeRetryRules(msg.rules));
-        if (msg.max != null) {
-          const m = Math.round(Number(msg.max));
-          await setPref("retryMax", Number.isFinite(m) ? Math.min(Math.max(m, 1), RETRY_MAX_CAP) : 2);
-        }
-        if (msg.delayMs != null) {
-          const d = Math.round(Number(msg.delayMs));
-          await setPref("retryDelayMs", Number.isFinite(d) ? Math.min(Math.max(d, 0), 60000) : 2000);
-        }
+        if (typeof msg.enabled === "boolean") await setPref("userRateLimitWait", msg.enabled);
         this.pushState();
         break;
       }
